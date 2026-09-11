@@ -1,0 +1,68 @@
+{
+  "name": "handscribe",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "HandScribe — whiteboard hand-drawing animation studio",
+  "author": "HandScribe",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "start": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "electron:dev": "electron . --dev",
+    "electron": "npm run build && electron .",
+    "electron:dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "@imgly/background-removal": "^1.7.0",
+    "kokoro-js": "^1.2.1",
+    "mp4-muxer": "^5.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.11",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^36.9.5",
+    "electron-builder": "^25.1.8",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.5.3",
+    "vite": "^6.3.5"
+  },
+  "build": {
+    "appId": "com.handscribe.app",
+    "productName": "HandScribe",
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "server/python/*.py",
+      "server/python/requirements-audio8.txt",
+      "scripts/*.bat",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.cjs"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false
+    },
+    "portable": {
+      "artifactName": "HandScribe-portable.exe"
+    }
+  },
+  "allowScripts": {
+    "electron@36.9.5": true
+  }
+}

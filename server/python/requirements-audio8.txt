@@ -1,0 +1,9 @@
+# Audio8 0.6B GPU server deps — installed into server/python/.venv (project-local).
+# torch is installed separately from the CUDA index (see scripts/setup-audio8.bat),
+# so this file must NOT list torch (PyPI would give you a CPU-only build).
+transformers>=4.57.0,<5
+soundfile>=0.12
+safetensors>=0.4
+huggingface_hub>=0.23
+faster-whisper>=1.0
+numpy<2

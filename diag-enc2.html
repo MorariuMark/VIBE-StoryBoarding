@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>H</title></head>
+<body>
+<div id="out">running...</div>
+<script type="module">
+import { exportFrames } from '/src/engine/exporter.ts'
+const out = (s) => { document.getElementById('out').textContent = s }
+try {
+  const c = document.createElement('canvas'); c.width = 1920; c.height = 1080
+  const x = c.getContext('2d')!
+  const t0 = performance.now()
+  const blob = await exportFrames(0.5, 30, (ctx, t) => {
+    ctx.fillStyle = '#123456'; ctx.fillRect(0, 0, 1920, 1080)
+    ctx.fillStyle = '#fff'; ctx.fillRect(100 + t * 500, 100, 200, 200)
+  }, (p) => out(`PROG ${p.frame}/${p.total} ${p.phase}`))
+  out(`OK size=${blob.size} ms=${Math.round(performance.now() - t0)}`)
+} catch (e) {
+  out('FAIL:' + String(e && e.message || e).slice(0, 300))
+}
+</script>
+</body>
+</html>

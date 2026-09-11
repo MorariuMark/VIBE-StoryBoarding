@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+.DS_Store
+# Project-local AI assets (gigabytes — re-created by scripts/setup-audio8.bat)
+/models/
+/server/python/.venv/
+/server/python/*.log
