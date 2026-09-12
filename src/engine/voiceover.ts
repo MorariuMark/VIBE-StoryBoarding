@@ -1,24 +1,30 @@
 /**
- * voiceover — local AI narration with Kokoro-82M (kokoro-js, 100% in-browser).
+ * voiceover — local AI narration with Kokoro-82M, served by the
+ * project-local voice server (server/python/audio8_server.py).
  *
- * All heavy work (model inference + FX) runs in a dedicated Web Worker
- * (voWorker.ts), so long renders never block the page. Auto mode prefers
- * WebGPU when the browser offers it, otherwise CPU/WASM.
+ * This is a from-scratch remake of the old in-browser kokoro-js path. The
+ * browser stack proved unfixable in the field: cached weights and voice
+ * vectors could silently corrupt (flaky downloads with no checksum), and
+ * every voice would come out as static/buzz with no error. The server runs
+ * the official torch voices with verified project-local files, self-tests
+ * every startup (see /health -> kokoro.selftest), and every render here is
+ * measurable — garbage output cannot hide anymore.
  *
- * Long scripts are split into sentence-safe blocks (<= MAX_BLOCK_CHARS),
- * synthesized sequentially, then concatenated with a natural pause between
- * blocks. Caption cues are derived from the true per-block audio durations,
- * so captions stay in sync with the voiceover on the timeline.
+ * Flow: script -> sentence-safe blocks (<= MAX_BLOCK_CHARS) -> one server
+ * synth per SENTENCE (exact per-sentence audio -> captions stay glued to the
+ * true speech) -> crossfade-joined with the pause between blocks.
  */
-import type { VoiceFxParams, FxResult } from './voiceFx'
+import type { VoiceFxParams, FxResult } from './voiceFx.ts'
+import { applyVoiceFx } from './voiceFx.ts'
+import { trimSilence } from './voiceFx.ts'
 
-export const VO_MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX'
+export const VO_MODEL_ID = 'hexgrad/Kokoro-82M'
 export const VO_SAMPLE_RATE = 24000
+export const VO_MODEL_SIZE = '~330MB'
 /**
- * Max characters sent to the model in a single generate() call.
- * kokoro-js tokenizes phonemes with truncation at ~510 tokens, and phoneme
- * strings run ~2x the character count — so 300 chars keeps every block
- * safely under the limit instead of being silently cut off mid-sentence.
+ * Max characters sent to the model in a single synth call. Kokoro handles
+ * long inputs, but short sentence calls give exact per-sentence timings for
+ * captions — blocks stay <= this size, sentences inside them go whole.
  */
 export const MAX_BLOCK_CHARS = 300
 /** Silence inserted between blocks (seconds) — the "natural pause". */
@@ -70,12 +76,11 @@ export const VOICES: VoiceMeta[] = [
   { id: 'bm_daniel', label: 'Daniel', gender: 'male', accent: 'British', grade: 'D' },
 ]
 
-export type VoEngine = 'auto' | 'wasm' | 'webgpu'
+/** Where Kokoro renders: the project-local voice server (auto = CUDA if present). */
+export type KokoroDevice = 'auto' | 'cuda' | 'cpu'
 
 export interface VoQuality {
-  engine: VoEngine
-  /** dtype preset: 'fast' = q8, 'quality' = fp32 */
-  quality: 'fast' | 'quality'
+  device: KokoroDevice
 }
 
 export interface EngineInfo {
@@ -85,14 +90,12 @@ export interface EngineInfo {
 
 /**
  * Scrub raw text into smooth TTS input:
- *  1. currency symbols jump behind the number ("$10" -> "10$"), which the
- *     phonemizer reads far more naturally than a leading symbol;
- *  2. markdown / code-ish symbols espeak would read aloud ("star", "slash",
- *     "tilde", …) are removed or spaced out, "#" before a digit becomes
- *     "number" ("issue #5" -> "issue number 5");
+ *  1. currency symbols jump behind the number ("$10" -> "10$"), which reads
+ *     far more naturally than a leading symbol;
+ *  2. markdown / code-ish symbols are removed or spaced out, "#" before a
+ *     digit becomes "number" ("issue #5" -> "issue number 5");
  *  3. emoji and exotic symbols are stripped (they become garbage phonemes);
  *  4. anything else outside the speakable set is dropped as a safety net.
- * kokoro-js normalizes the rest itself (decimals, abbreviations, quotes).
  */
 export function sanitizeForTTS(text: string): string {
   return text
@@ -111,105 +114,84 @@ export function sanitizeForTTS(text: string): string {
     .trim()
 }
 
-interface DeviceAttempt { device: 'webgpu' | 'wasm'; dtype: string }
+// ---------------------------------------------------------------------------
+// Voice server client (Kokoro renders here — no in-browser inference left)
+// ---------------------------------------------------------------------------
 
-function gpuAvailable(): boolean {
+/** Base URL of the project-local voice server (same process serves Audio8). */
+let voiceServerUrl = 'http://127.0.0.1:8010'
+
+export function setVoiceServerUrl(url: string) {
+  if (url) voiceServerUrl = url.replace(/\/+$/, '')
+}
+
+function serverBase(): string {
+  return voiceServerUrl || 'http://127.0.0.1:8010'
+}
+
+/** In-flight request controller, so Cancel actually cancels. */
+let activeCtrl: AbortController | null = null
+
+async function kokoroPost(path: string, body: Record<string, unknown>): Promise<Response> {
+  const ctrl = new AbortController()
+  activeCtrl = ctrl
   try {
-    return typeof navigator !== 'undefined' && !!(navigator as Navigator & { gpu?: unknown }).gpu
-  } catch {
-    return false
+    const res = await fetch(`${serverBase()}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    })
+    return res
+  } finally {
+    if (activeCtrl === ctrl) activeCtrl = null
   }
 }
 
-/**
- * Correct device/dtype matrix. Per the kokoro-js README, WebGPU requires
- * fp32 — running the q8 quantized model on WebGPU yields corrupt audio.
- * Auto prefers the GPU when the browser offers one.
- */
-function attemptsFor(q: VoQuality): DeviceAttempt[] {
-  if (q.engine === 'wasm') return [{ device: 'wasm', dtype: q.quality === 'quality' ? 'fp32' : 'q8' }]
-  if (q.engine === 'webgpu') return [{ device: 'webgpu', dtype: 'fp32' }]
-  const cpuDtype = q.quality === 'quality' ? 'fp32' : 'q8'
-  if (gpuAvailable()) return [{ device: 'webgpu', dtype: 'fp32' }, { device: 'wasm', dtype: cpuDtype }]
-  return [{ device: 'wasm', dtype: cpuDtype }]
+async function throwForBad(res: Response, prefix: string): Promise<never> {
+  let detail = ''
+  try {
+    const j = (await res.json()) as { detail?: unknown }
+    detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j)
+  } catch {
+    detail = await res.text().catch(() => '')
+  }
+  throw new Error(`${prefix}: HTTP ${res.status}${detail ? ` — ${detail.slice(0, 300)}` : ''}`)
 }
 
-// ---------------------------------------------------------------------------
-// Background worker manager
-// ---------------------------------------------------------------------------
-
-interface PendingCall {
-  res: (v: never) => void
-  rej: (e: unknown) => void
-  onStatus?: (msg: string, progress: number | null) => void
+export interface KokoroServerState {
+  ready: boolean
+  loading: boolean
+  device: string
+  dirMB: number | null
+  selftest: { ok: boolean; rms: number; voicedRatio: number; ms: number } | null
+  error: string | null
 }
 
-let worker: Worker | null = null
-let seq = 0
-const pending = new Map<number, PendingCall>()
+export async function kokoroServerState(): Promise<KokoroServerState> {
+  const res = await fetch(`${serverBase()}/health`)
+  if (!res.ok) throw new Error(`Voice server replied HTTP ${res.status} — start it with scripts\\start-audio8.bat`)
+  const j = (await res.json()) as { kokoro?: Partial<KokoroServerState> }
+  const k = j.kokoro ?? {}
+  return {
+    ready: k.ready ?? false,
+    loading: k.loading ?? false,
+    device: typeof k.device === 'string' ? k.device : 'unknown',
+    dirMB: typeof k.dirMB === 'number' ? k.dirMB : null,
+    selftest: k.selftest ?? null,
+    error: typeof k.error === 'string' ? k.error : null,
+  }
+}
+
 let engineInfo: EngineInfo | null = null
 let loadedKey = ''
 
-function getWorker(): Worker {
-  if (!worker) {
-    let w: Worker
-    try {
-      w = new Worker(new URL('./voWorker.ts', import.meta.url), { type: 'module' })
-    } catch (e) {
-      throw new Error(`This browser blocked the voice background worker: ${e instanceof Error ? e.message : e}`)
-    }
-    w.onmessage = (e: MessageEvent) => {
-      const m = e.data as { id: number; type: string; progress?: number | null; status?: string | null; message?: string }
-      const p = pending.get(m.id)
-      if (!p) return
-      if (m.type === 'load-progress') {
-        const label = m.status ?? 'Downloading voice model…'
-        if (typeof m.progress === 'number') {
-          p.onStatus?.(`${label} ${Math.round(m.progress)}%`, m.progress / 100)
-        } else {
-          p.onStatus?.(label, null)
-        }
-        return
-      }
-      pending.delete(m.id)
-      if (m.type === 'error') p.rej(new Error(m.message || 'Voice engine error'))
-      else p.res(m as never)
-    }
-    w.onerror = (e: ErrorEvent) => {
-      const err = new Error(`Voice worker crashed: ${e.message || 'unknown error'}`)
-      pending.forEach(({ rej }) => rej(err))
-      pending.clear()
-      try {
-        w.terminate()
-      } catch { /* noop */ }
-      if (worker === w) {
-        worker = null
-        engineInfo = null
-        loadedKey = ''
-      }
-    }
-    worker = w
-  }
-  return worker
-}
-
-function callWorker<T>(msg: Record<string, unknown>, onStatus?: (msg: string, progress: number | null) => void): Promise<T> {
-  const w = getWorker()
-  const id = ++seq
-  return new Promise<T>((res, rej) => {
-    pending.set(id, { res: res as (v: never) => void, rej, onStatus })
-    w.postMessage({ ...msg, id })
-  })
-}
-
-/** Hard-stop the engine immediately (unblocks a frozen-feeling cancel). */
+/** Hard-stop: abort the in-flight request and forget the engine state. */
 export function terminateVoiceEngine() {
-  pending.forEach(({ rej }) => rej(new Error('Voice engine stopped')))
-  pending.clear()
   try {
-    worker?.terminate()
+    activeCtrl?.abort()
   } catch { /* noop */ }
-  worker = null
+  activeCtrl = null
   engineInfo = null
   loadedKey = ''
 }
@@ -218,7 +200,31 @@ export function getEngineInfo(): EngineInfo | null {
   return engineInfo
 }
 
-/** Serialize all worker calls through one FIFO lane (no concurrent inference). */
+/**
+ * Clear the Kokoro preview bank (in-memory + IndexedDB) and engine state.
+ * There are no browser weights to nuke anymore — the server owns verified
+ * files. Next use re-renders previews from the server.
+ */
+export async function resetKokoroModel(): Promise<void> {
+  cancelPreviewBank()
+  terminateVoiceEngine()
+  for (const url of bankUrls.values()) {
+    try {
+      URL.revokeObjectURL(url)
+    } catch { /* noop */ }
+  }
+  bankUrls.clear()
+  try {
+    await new Promise<void>((resolve) => {
+      const req = indexedDB.deleteDatabase('handscribe-vo')
+      req.onsuccess = () => resolve()
+      req.onerror = () => resolve()
+      req.onblocked = () => resolve()
+    })
+  } catch { /* IndexedDB unavailable */ }
+}
+
+/** Serialize all server calls through one FIFO lane (no concurrent inference). */
 let ttsLane: Promise<unknown> = Promise.resolve()
 function lane<T>(fn: () => Promise<T>): Promise<T> {
   const run = ttsLane.then(fn, fn)
@@ -227,97 +233,174 @@ function lane<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Load (or reuse) the Kokoro model inside the worker. Resolves with the
- * device/dtype actually used, so the UI can show where it is running.
+ * Make sure the server-side Kokoro engine is ready. Triggers the load, then
+ * polls /health until the startup self-test passes — so by the time this
+ * resolves, the engine has PROVEN it renders speech, not static.
  */
 export function ensureVoiceModel(
   quality: VoQuality,
   onStatus?: (msg: string, progress: number | null) => void,
 ): Promise<EngineInfo> {
-  const attempts = attemptsFor(quality)
-  const key = attempts.map(a => `${a.device}/${a.dtype}`).join('+')
+  const key = `kokoro/${quality.device}`
   if (engineInfo && loadedKey === key) {
     return Promise.resolve(engineInfo)
   }
   return lane(async () => {
-    // re-check inside the lane (a concurrent caller may have loaded meanwhile)
     if (engineInfo && loadedKey === key) return engineInfo
-    let lastErr: unknown = null
-    for (const { device, dtype } of attempts) {
-      try {
-        const sizeHint = dtype === 'fp32' ? '~300MB' : '~100MB'
-        onStatus?.(`Loading Kokoro-82M voice model (${device}/${dtype}, first run downloads ${sizeHint})…`, null)
-        await callWorker<{ type: string }>(
-          { type: 'load', device, dtype },
-          (msg, p) => {
-            if (p === null) onStatus?.(msg, null)
-            else onStatus?.(`Downloading voice model… ${Math.round(p * 100)}%`, p)
-          },
-        )
-        engineInfo = { device, dtype }
-        loadedKey = key
-        onStatus?.(`Voice model ready (${device}/${dtype})`, 1)
-        return engineInfo
-      } catch (e) {
-        lastErr = e
-        if (e instanceof Error && /stopped|cancelled/i.test(e.message)) throw e
-      }
+    onStatus?.('Starting Kokoro-82M on the voice server…', null)
+    try {
+      await kokoroPost('/api/kokoro/load', {})
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') throw new Error('Voiceover cancelled')
+      throw new Error(`Voice server not reachable at ${serverBase()} — start it with scripts\\start-audio8.bat`)
     }
-    throw new Error(`Could not load the Kokoro voice model in this browser: ${lastErr instanceof Error ? lastErr.message : lastErr}`)
+    const deadline = Date.now() + 5 * 60 * 1000
+    for (;;) {
+      let st: KokoroServerState
+      try {
+        st = await kokoroServerState()
+      } catch {
+        throw new Error(`Voice server not reachable at ${serverBase()} — start it with scripts\\start-audio8.bat`)
+      }
+      if (st.error) throw new Error(`Kokoro failed on the server: ${st.error}`)
+      if (st.ready && st.selftest?.ok) {
+        engineInfo = { device: st.device, dtype: 'fp32' }
+        loadedKey = key
+        onStatus?.(
+          `Kokoro-82M ready (${st.device}/fp32, verified speech in ${st.selftest.ms}ms)`,
+          1,
+        )
+        return engineInfo
+      }
+      if (Date.now() > deadline) throw new Error('Kokoro took too long to start (5 min) — see server logs')
+      onStatus?.(
+        st.selftest && !st.selftest.ok
+          ? 'Kokoro self-test FAILED on the server — refusing to render (see server logs)'
+          : 'Loading Kokoro-82M voice model on the server (first run downloads weights)…',
+        null,
+      )
+      if (st.selftest && !st.selftest.ok) {
+        throw new Error('Kokoro self-test failed: the server renders silence/static. See server logs.')
+      }
+      await new Promise(r => setTimeout(r, 2000))
+    }
   })
 }
 
-async function workerGen(
+/** One server synth call -> mono Float32 + rate. */
+async function kokoroSynth(
   text: string,
   voice: string,
   speed: number,
+  device: KokoroDevice,
 ): Promise<{ samples: Float32Array; rate: number }> {
-  const m = await lane(() => callWorker<{ type: string; samples: unknown; rate: unknown }>({
-    type: 'gen', text, voice, speed,
-  }))
-  const s = m.samples instanceof Float32Array ? m.samples : Float32Array.from(m.samples as ArrayLike<number>)
-  const rate = typeof m.rate === 'number' && Number.isFinite(m.rate) && m.rate > 0 ? m.rate : VO_SAMPLE_RATE
-  return { samples: s, rate }
+  let res: Response
+  try {
+    res = await lane(() => kokoroPost('/api/kokoro/synth', { text, voice, speed, device }))
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') throw new Error('Voiceover cancelled')
+    throw e
+  }
+  if (!res.ok) await throwForBad(res, 'Kokoro synthesis')
+  const buf = await res.arrayBuffer()
+  return parseWavPcm16(buf)
+}
+
+/**
+ * Minimal WAV decoder for the server's PCM16 output. Deliberately NOT using
+ * AudioContext: decoding must work everywhere (including contexts without an
+ * audio device) and stay bit-exact for caption timing.
+ */
+export function parseWavPcm16(buf: ArrayBuffer): { samples: Float32Array; rate: number } {
+  const v = new DataView(buf)
+  const str = (off: number, len: number) => {
+    let s = ''
+    for (let i = 0; i < len; i++) s += String.fromCharCode(v.getUint8(off + i))
+    return s
+  }
+  if (str(0, 4) !== 'RIFF' || str(8, 4) !== 'WAVE') throw new Error('Kokoro server returned non-WAV audio')
+  let pos = 12
+  let fmt: { channels: number; rate: number; bits: number } | null = null
+  let dataOff = -1
+  let dataLen = 0
+  while (pos + 8 <= v.byteLength) {
+    const id = str(pos, 4)
+    const len = v.getUint32(pos + 4, true)
+    if (id === 'fmt ') {
+      const audioFmt = v.getUint16(pos + 8, true)
+      if (audioFmt !== 1) throw new Error(`Unsupported Kokoro WAV format (${audioFmt})`)
+      fmt = { channels: v.getUint16(pos + 10, true), rate: v.getUint32(pos + 12, true), bits: v.getUint16(pos + 22, true) }
+    } else if (id === 'data') {
+      dataOff = pos + 8
+      dataLen = len
+    }
+    pos += 8 + len + (len % 2)
+  }
+  if (!fmt || dataOff < 0) throw new Error('Malformed Kokoro WAV (no fmt/data)')
+  if (fmt.bits !== 16) throw new Error(`Unsupported Kokoro WAV depth (${fmt.bits}-bit)`)
+  const n = Math.floor(dataLen / 2 / fmt.channels)
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) {
+    let acc = 0
+    for (let c = 0; c < fmt.channels; c++) {
+      acc += v.getInt16(dataOff + (i * fmt.channels + c) * 2, true) / 32768
+    }
+    out[i] = acc / fmt.channels
+  }
+  return { samples: out, rate: fmt.rate }
+}
+
+/** Split text into sentences (Intl.Segmenter with a regex fallback). */
+export function splitSentences(text: string): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (!clean) return []
+  try {
+    const Seg = (Intl as unknown as {
+      Segmenter?: new (
+        locale: string,
+        opts: { granularity: string },
+      ) => { segment(s: string): Iterable<{ segment: string }> }
+    }).Segmenter
+    if (typeof Seg === 'function') {
+      const out: string[] = []
+      const it = new Seg('en', { granularity: 'sentence' }).segment(text) as Iterable<{ segment: string }>
+      for (const s of it) {
+        const t = s.segment.trim()
+        if (t) out.push(t)
+      }
+      if (out.length) return out
+    }
+  } catch { /* fallback below */ }
+  return clean.match(/[^.!?…]+[.!?…]+["”']?\s*|[^.!?…]+$/g)?.map(s => s.trim()).filter(Boolean) ?? [clean]
 }
 
 /** Sentence-accurate block render: exact audio + text per sentence. */
-async function workerGenBlock(
+async function synthBlock(
   text: string,
   voice: string,
   speed: number,
+  device: KokoroDevice,
 ): Promise<{ pieces: { text: string; samples: Float32Array }[]; rate: number }> {
-  const m = await lane(() => callWorker<{
-    type: string
-    pieces: { text: unknown; samples: unknown }[]
-    rate: unknown
-  }>({
-    type: 'genblock', text, voice, speed,
-  }))
-  if (!Array.isArray(m.pieces) || !m.pieces.length) throw new Error('empty sentence stream')
-  const rate = typeof m.rate === 'number' && Number.isFinite(m.rate) && m.rate > 0 ? m.rate : VO_SAMPLE_RATE
-  return {
-    rate,
-    pieces: m.pieces
-      .map(p => ({
-        text: String(p.text ?? ''),
-        samples: p.samples instanceof Float32Array ? p.samples : Float32Array.from(p.samples as ArrayLike<number>),
-      }))
-      .filter(p => p.samples.length > 0),
+  const pieces: { text: string; samples: Float32Array }[] = []
+  let rate = VO_SAMPLE_RATE
+  for (const sentence of splitSentences(text)) {
+    if (voiceoverAbort.aborted) throw new Error('Voiceover cancelled')
+    const { samples, rate: r } = await kokoroSynth(sentence, voice, speed, device)
+    rate = r
+    const trimmed = trimSilence(samples, r)
+    if (trimmed.length > 0) pieces.push({ text: sentence, samples: trimmed })
   }
+  if (!pieces.length) throw new Error('Kokoro returned no audio')
+  return { pieces, rate }
 }
 
-/** Run the FX chain in the worker (keeps long-audio processing off the UI thread). */
+/** Run the FX chain right here (pure DSP, fast enough for voiceover lengths). */
 export async function renderVoiceFx(
   samples: Float32Array,
   rate: number,
   fx: VoiceFxParams,
 ): Promise<FxResult> {
-  const m = await lane(() => callWorker<{ type: string; samples: unknown; timeScale: unknown }>({
-    type: 'fx', samples, rate, fx,
-  }))
-  const s = m.samples instanceof Float32Array ? m.samples : Float32Array.from(m.samples as ArrayLike<number>)
-  const timeScale = typeof m.timeScale === 'number' && Number.isFinite(m.timeScale) && m.timeScale > 0 ? m.timeScale : 1
-  return { samples: s, timeScale }
+  return applyVoiceFx(samples, rate, fx)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,9 +516,10 @@ export function estimateSeconds(script: string, speed: number): number {
 }
 
 /**
- * Synthesize the FULL script: chunk -> sequential worker-side generate ->
- * concat with a natural pause between blocks. Works for scripts of any
- * length; the main thread only awaits messages, so the page stays alive.
+ * Synthesize the FULL script: chunk -> per-sentence server synth ->
+ * crossfade-joined with a natural pause between blocks. Works for scripts of
+ * any length; the page stays responsive because the heavy work is server-side
+ * and the main thread only awaits fetches.
  */
 export async function generateVoiceover(script: string, opts: VoiceoverOptions): Promise<VoiceoverResult> {
   const clean = sanitizeForTTS(script)
@@ -453,6 +537,7 @@ export async function generateVoiceover(script: string, opts: VoiceoverOptions):
     }
     throw e
   }
+  const device = opts.quality.device
 
   // segments in final order: audio pieces + silence gaps (zeros when rendered)
   type Seg = { kind: 'a'; s: Float32Array } | { kind: 's'; n: number }
@@ -468,13 +553,13 @@ export async function generateVoiceover(script: string, opts: VoiceoverOptions):
       if (voiceoverAbort.aborted) throw new Error('Voiceover cancelled')
       let pieces: { text: string; samples: Float32Array }[]
       try {
-        const r = await workerGenBlock(blocks[i], opts.voice, opts.speed)
+        const r = await synthBlock(blocks[i], opts.voice, opts.speed, device)
         rate = r.rate
         pieces = r.pieces
       } catch (e) {
         if (voiceoverAbort.aborted) throw new Error('Voiceover cancelled')
         // fallback: whole block as one span (previous behavior)
-        const single = await workerGen(blocks[i], opts.voice, opts.speed)
+        const single = await kokoroSynth(blocks[i], opts.voice, opts.speed, device)
         rate = single.rate
         pieces = [{ text: blocks[i], samples: single.samples }]
       }
@@ -543,7 +628,7 @@ export async function previewVoice(voice: string, speed: number, quality: VoQual
   const clean = sanitizeForTTS(text ?? DEFAULT_PREVIEW_TEXT) || DEFAULT_PREVIEW_TEXT
   const line = chunkScript(clean)[0] ?? clean
   try {
-    const { samples, rate } = await workerGen(line, voice, speed)
+    const { samples, rate } = await kokoroSynth(line, voice, speed, quality.device)
     const blob = encodeWav(samples, rate)
     return { url: URL.createObjectURL(blob), blob, duration: samples.length / rate }
   } catch (e) {
@@ -635,7 +720,7 @@ function hashStr(s: string): string {
 }
 
 export function bankKey(voice: string, speed: number, previewText: string, quality: VoQuality): string {
-  return [voice, speed.toFixed(2), hashStr(previewText), quality.engine, quality.quality].join('|')
+  return [voice, speed.toFixed(2), hashStr(previewText), 'srv', quality.device].join('|')
 }
 
 function idbOpen(): Promise<IDBDatabase> {
@@ -708,7 +793,7 @@ function broadcast(run: BankRun) {
 
 /**
  * Build the full preview bank: IndexedDB hits are instant, missing voices are
- * synthesized sequentially in the background worker. Safe to call repeatedly.
+ * synthesized sequentially on the voice server. Safe to call repeatedly.
  */
 export function ensurePreviewBank(
   quality: VoQuality,
@@ -720,7 +805,7 @@ export function ensurePreviewBank(
   const clean = sanitizeForTTS(previewText) || DEFAULT_PREVIEW_TEXT
   // NOTE: keys always use the sanitized text — callers must do the same via
   // bankKey(id, speed, sanitizedText, quality), or lookups will always miss.
-  const paramsKey = [speed.toFixed(2), hashStr(clean), quality.engine, quality.quality].join('|')
+  const paramsKey = [speed.toFixed(2), hashStr(clean), quality.device].join('|')
   if (currentRun && currentRun.paramsKey === paramsKey && !currentRun.aborted) {
     // re-entrant (StrictMode remounts, repeated clicks): attach, don't restart
     if (onProgress) {
@@ -757,7 +842,7 @@ export function ensurePreviewBank(
             bankUrls.set(key, URL.createObjectURL(stored))
             run.progress.cached++
           } else {
-            const { samples, rate } = await workerGen(line, v.id, speed)
+            const { samples, rate } = await kokoroSynth(line, v.id, speed, quality.device)
             if (run.aborted) break
             const blob = encodeWav(samples, rate)
             bankUrls.set(key, URL.createObjectURL(blob))

@@ -6,4 +6,8 @@ soundfile>=0.12
 safetensors>=0.4
 huggingface_hub>=0.23
 faster-whisper>=1.0
+# Kokoro-82M server-side TTS (replaces the old in-browser kokoro-js path):
+# official PyTorch voices + misaki G2P (no espeak binary needed).
+kokoro>=0.9
+misaki[en]
 numpy<2

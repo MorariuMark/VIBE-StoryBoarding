@@ -5,7 +5,8 @@ HandScribe voiceover panel over HTTP so generation runs on your CUDA GPU.
 Everything lives INSIDE the project folder — nothing is installed globally:
   <project>/server/python/.venv/   Python venv (torch CUDA, transformers, …)
   <project>/models/audio8/         Audio8 checkpoint (downloaded once)
-  <project>/models/hf-cache/       Hugging Face cache dir (env-redirected)
+  <project>/models/hf-cache/       Hugging Face cache dir (env-redirected,
+                                   incl. Kokoro-82M weights + voices)
   <project>/models/stt/            faster-whisper STT model (for auto-transcript)
   <project>/models/audio8/voices/  saved clone voices (wav + transcript json)
 
@@ -264,14 +265,7 @@ def _synthesize(payload: dict) -> tuple[bytes, int]:
                     pass
 
 
-def _transcribe(payload: dict) -> str:
-    raw_b64 = str(payload.get("audio_b64", "") or "")
-    if not raw_b64:
-        raise ValueError("audio_b64 is empty")
-    raw = base64.b64decode(raw_b64)
-    if len(raw) > 25 * 1024 * 1024:
-        raise ValueError("clip too large for transcription (25MB max)")
-    want = str(payload.get("model", STT_DEFAULT) or STT_DEFAULT)
+def _transcribe_bytes(raw: bytes, want: str) -> str:
     if want not in ("base", "small"):
         want = STT_DEFAULT
     with _stt_lock:
@@ -296,8 +290,7 @@ def _transcribe(payload: dict) -> str:
                 _stt["error"] = str(e)
                 raise RuntimeError(f"STT model load failed: {e}")
         model = _stt["model"]
-        suffix = mimetypes.guess_extension(str(payload.get("audio_mime", "audio/wav"))) or ".wav"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         try:
             tmp.write(raw)
             tmp.close()
@@ -310,8 +303,306 @@ def _transcribe(payload: dict) -> str:
                 pass
 
 
+def _transcribe_segments(raw: bytes, want: str) -> list:
+    """Transcribe and return per-segment spans for timeline sync.
+
+    Each item: {"text": str, "start": float, "end": float} (seconds,
+    audio-relative). Segment granularity suits sentence-level image
+    sync — word timestamps cost more and drift harder.
+    """
+    if want not in ("base", "small"):
+        want = STT_DEFAULT
+    with _stt_lock:
+        if _stt["model"] is None or _stt["name"] != want:
+            try:
+                from faster_whisper import WhisperModel  # type: ignore
+            except Exception as e:
+                raise RuntimeError(f"STT deps missing in project venv (run scripts\\setup-audio8.bat): {e}")
+            import torch  # type: ignore
+
+            cuda = bool(torch.cuda.is_available())
+            try:
+                _stt["model"] = WhisperModel(
+                    want,
+                    device="cuda" if cuda else "cpu",
+                    compute_type="float16" if cuda else "int8",
+                    download_root=str(STT_DIR),
+                )
+                _stt["name"] = want
+                _stt["error"] = None
+            except Exception as e:
+                _stt["error"] = str(e)
+                raise RuntimeError(f"STT model load failed: {e}")
+        model = _stt["model"]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        try:
+            tmp.write(raw)
+            tmp.close()
+            segments, _info = model.transcribe(tmp.name, beam_size=5)
+            out = []
+            for s in segments:
+                t = (s.text or "").strip()
+                if not t:
+                    continue
+                out.append({"text": t, "start": float(s.start or 0), "end": float(s.end or 0)})
+            return out
+        finally:
+            try:
+                Path(tmp.name).unlink()
+            except OSError:
+                pass
+
+
+def _transcribe(payload: dict) -> str:
+    raw_b64 = str(payload.get("audio_b64", "") or "")
+    if not raw_b64:
+        raise ValueError("audio_b64 is empty")
+    raw = base64.b64decode(raw_b64)
+    if len(raw) > 25 * 1024 * 1024:
+        raise ValueError("clip too large for transcription (25MB max)")
+    want = str(payload.get("model", STT_DEFAULT) or STT_DEFAULT)
+    return _transcribe_bytes(raw, want)
+
+
+def _frame_f0(frame: "np.ndarray", sr: int) -> float | None:
+    """Median-voiced F0 of one short frame via autocorrelation (50-500 Hz)."""
+    import numpy as np
+
+    if np.abs(frame).max() < 0.02:
+        return None
+    w = frame * np.hanning(len(frame))
+    ac = np.correlate(w, w, mode="full")[len(w) - 1 :]
+    if ac[0] <= 1e-9:
+        return None
+    ac = ac / ac[0]
+    lo, hi = int(sr / 500), int(sr / 50)
+    if hi >= len(ac):
+        return None
+    peak = int(np.argmax(ac[lo:hi])) + lo
+    if ac[peak] < 0.35:
+        return None
+    return float(sr / peak)
+
+
+def _steady_anchor(name: str, window_sec: float = 10.0) -> dict:
+    """Carve the prosodically flattest window out of a saved voice and save it
+    as `<name>-steady` (audio + fresh STT transcript).
+
+    Why: every narration chunk re-anchors to its reference's OPENING pitch.
+    A 40s excited opening (≈117 Hz here) makes each ~10s chunk start high and
+    end low — an audible upward jump at every boundary, perceived as pitch
+    rising over the narration. A short, flat anchor removes the sawtooth.
+    """
+    import numpy as np
+    import soundfile as sf  # type: ignore
+
+    wav, _meta = _voice_paths(name)
+    if not wav.is_file():
+        raise ValueError(f"saved voice '{name}' not found")
+    window_sec = min(20.0, max(5.0, float(window_sec or 10.0)))
+    x, sr = sf.read(str(wav), dtype="float32", always_2d=False)
+    if getattr(x, "ndim", 1) > 1:
+        x = x.mean(axis=1)
+    dur = len(x) / sr
+    if dur < window_sec + 1:
+        raise ValueError(f"clip is only {dur:.0f}s — a steady anchor needs >{window_sec + 1:.0f}s")
+    step, flen = 0.5, int(sr * 0.5)
+    grid: list[float | None] = []
+    t = 0.0
+    while t + 0.5 <= dur:
+        grid.append(_frame_f0(np.asarray(x[int(t * sr) : int(t * sr) + flen]), sr))
+        t += step
+    voiced_all = [v for v in grid if v is not None]
+    if not voiced_all:
+        raise ValueError("no voiced speech found — use a cleaner clip")
+    clip_median = float(np.median(voiced_all))
+    win_frames = int(round(window_sec / step))
+    best, best_key = 0.0, None
+    for start in range(0, len(grid) - win_frames + 1):
+        seg = [v for v in grid[start : start + win_frames] if v is not None]
+        if len(seg) < int(win_frames * 0.6):
+            continue
+        # flat AND near the clip's overall median pitch: a high/excited opening
+        # biases every chunk start upward, which is the sawtooth we remove.
+        key = (float(np.std(seg)) + 0.5 * abs(float(np.mean(seg)) - clip_median))
+        if best_key is None or key < best_key:
+            best_key, best = key, start * step
+    if best_key is None:
+        raise ValueError("no clean voiced passage found — use a cleaner clip")
+    cut = x[int(best * sr) : int((best + window_sec) * sr)]
+    buf = io.BytesIO()
+    sf.write(buf, cut, sr, format="WAV", subtype="PCM_16")
+    clip_bytes = buf.getvalue()
+    transcript = _transcribe_bytes(clip_bytes, "small")
+    if not transcript:
+        raise ValueError("STT heard no speech in the flattest passage")
+    import datetime as _dt
+
+    slug = _safe_voice_name(f"{_safe_voice_name(name)}-steady")
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    wpath, mpath = VOICES_DIR / f"{slug}.wav", VOICES_DIR / f"{slug}.json"
+    wpath.write_bytes(clip_bytes)
+    mpath.write_text(
+        json.dumps(
+            {"transcript": transcript, "created": _dt.datetime.now().isoformat(timespec="seconds"),
+             "anchorOf": _safe_voice_name(name), "anchorStartSec": round(best, 1)},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return {"name": slug, "transcript": transcript, "startSec": round(best, 1),
+            "sizeBytes": len(clip_bytes)}
+
+
+# ---------------------------------------------------------------- Kokoro-82M
+# Server-side Kokoro (official torch voices + misaki G2P, no espeak binary).
+# This replaced the old in-browser kokoro-js path: browser weight caches,
+# WebGPU/WASM driver variance and CDN phonemizer data cannot corrupt output
+# anymore — files are verified project-local and every render is measurable.
+
+KOKORO_ID = "hexgrad/Kokoro-82M"
+KOKORO_SR = 24000
+KOKORO_MAX_CHARS = 600
+
+_kokoro: dict = {
+    "pipes": {},  # (lang, device) -> KPipeline
+    "g2p": {},  # british? -> misaki G2P
+    "device": "cpu",
+    "error": None,
+    "selftest": None,  # {ok, rms, voicedRatio, ms, voice}
+}
+_kokoro_lock = threading.Lock()
+
+
+def _kokoro_device() -> str:
+    try:
+        import torch  # type: ignore
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _kokoro_pipe(lang: str, device: str):
+    key = (lang, device)
+    if key in _kokoro["pipes"]:
+        return _kokoro["pipes"][key]
+    from kokoro import KPipeline  # type: ignore
+    from misaki import en as misaki_en  # type: ignore
+
+    british = lang == "b"
+    if british not in _kokoro["g2p"]:
+        _kokoro["g2p"][british] = misaki_en.G2P(trf=False, british=british, fallback=None)
+    pipe = KPipeline(lang_code=lang, en_callable=_kokoro["g2p"][british], device=device)
+    _kokoro["pipes"][key] = pipe
+    return pipe
+
+
+def _kokoro_ensure(lang: str, device: str):
+    """Load (or reuse) the Kokoro pipeline; raises with a readable message."""
+    with _kokoro_lock:
+        try:
+            pipe = _kokoro_pipe(lang, device)
+            _kokoro["device"] = device
+            _kokoro["error"] = None
+            return pipe
+        except Exception as e:
+            _kokoro["error"] = str(e)
+            raise RuntimeError(f"Kokoro load failed: {e}")
+
+
+def _kokoro_synth(payload: dict) -> bytes:
+    import soundfile as sf  # type: ignore
+    import torch  # type: ignore
+
+    with _kokoro_lock:
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            raise ValueError("text is empty")
+        if len(text) > KOKORO_MAX_CHARS:
+            raise ValueError(f"text too long ({len(text)} chars, max {KOKORO_MAX_CHARS})")
+        voice = str(payload.get("voice", "af_heart") or "af_heart").strip()
+        speed = float(payload.get("speed", 1.0) or 1.0)
+        speed = min(2.0, max(0.5, speed))
+        want_cpu = str(payload.get("device", "auto") or "auto") == "cpu"
+        device = "cpu" if want_cpu else _kokoro_device()
+        lang = "b" if voice[:1] == "b" else "a"
+        try:
+            pipe = _kokoro_pipe(lang, device)
+            _kokoro["device"] = device
+            _kokoro["error"] = None
+        except Exception as e:
+            _kokoro["error"] = str(e)
+            raise RuntimeError(f"Kokoro load failed: {e}")
+        try:
+            chunks: list = []
+            with torch.inference_mode():
+                for _gs, _ps, audio in pipe(text, voice=voice, speed=speed):
+                    chunks.append(audio.cpu().numpy())
+        except Exception as e:
+            raise RuntimeError(f"Kokoro synthesis failed (voice '{voice}'): {e}")
+        if not chunks:
+            raise RuntimeError("Kokoro returned no audio")
+        import numpy as np
+
+        wav = np.concatenate(chunks).astype(np.float32)
+        buf = io.BytesIO()
+        sf.write(buf, wav, KOKORO_SR, format="WAV", subtype="PCM_16")
+        return buf.getvalue()
+
+
+def _kokoro_selftest() -> dict:
+    """Startup proof: synthesize a line and verify it is actually speech
+    (energy + voiced periodicity), not silence or static. Result is served
+    on /health so the UI — and the operator — can trust the engine."""
+    import time as _time
+
+    import numpy as np
+
+    t0 = _time.time()
+    out: dict = {"ok": False, "rms": 0.0, "voicedRatio": 0.0, "ms": 0, "voice": "af_heart"}
+    try:
+        wav_bytes = _kokoro_synth(
+            {"text": "Hello, this is a voice check.", "voice": "af_heart", "speed": 1.0}
+        )
+        import soundfile as sf  # type: ignore
+
+        x, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
+        x = np.asarray(x, dtype=np.float64)
+        rms = float(np.sqrt((x**2).mean())) if len(x) else 0.0
+        flen = sr // 10
+        voiced = total = 0
+        for s in range(0, len(x) - flen, flen):
+            total += 1
+            fr = x[s : s + flen] * np.hanning(flen)
+            if np.abs(fr).max() < 0.02:
+                continue
+            ac = np.correlate(fr, fr, mode="full")[flen - 1 :]
+            if ac[0] <= 1e-9:
+                continue
+            ac = ac / ac[0]
+            lo, hi = int(sr / 500), int(sr / 50)
+            if hi >= len(ac):
+                continue
+            if ac[int(np.argmax(ac[lo:hi])) + lo] >= 0.35:
+                voiced += 1
+        out.update(
+            {
+                "ok": bool(rms > 0.01 and (voiced / max(1, total)) > 0.25),
+                "rms": round(rms, 4),
+                "voicedRatio": round(voiced / max(1, total), 3),
+                "ms": int((_time.time() - t0) * 1000),
+            }
+        )
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    _kokoro["selftest"] = out
+    print(f"[kokoro] self-test: {out}", flush=True)
+    return out
+
+
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "Audio8GPUServer/1.1"
+    server_version = "Audio8GPUServer/2.0"
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -353,6 +644,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 cuda = False
             loaded = _state["model"] is not None
+            kokoro_dir = HF_CACHE / "hub" / "models--hexgrad--Kokoro-82M"
             self._json(
                 {
                     "ok": loaded,
@@ -368,6 +660,14 @@ class _Handler(BaseHTTPRequestHandler):
                     "sttModel": _stt["name"] or STT_DEFAULT,
                     "sttReady": _stt["model"] is not None,
                     "error": _state["error"],
+                    "kokoro": {
+                        "ready": _kokoro["selftest"] is not None and bool(_kokoro["selftest"].get("ok")),
+                        "loading": _kokoro_started and _kokoro["selftest"] is None and not _kokoro["error"],
+                        "device": _kokoro["device"],
+                        "dirMB": dir_mb(kokoro_dir),
+                        "selftest": _kokoro["selftest"],
+                        "error": _kokoro["error"],
+                    },
                 }
             )
             return
@@ -425,14 +725,26 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"detail": str(e)}, 400)
                 return
             try:
-                text = _transcribe(payload)
+                raw_b64 = str(payload.get("audio_b64", "") or "")
+                if not raw_b64:
+                    raise ValueError("audio_b64 is empty")
+                raw = base64.b64decode(raw_b64)
+                if len(raw) > 25 * 1024 * 1024:
+                    raise ValueError("clip too large for transcription (25MB max)")
+                want = str(payload.get("model", STT_DEFAULT) or STT_DEFAULT)
+                if payload.get("timestamps"):
+                    # one inference only — text derives from the same segments
+                    segments = _transcribe_segments(raw, want)
+                    text = " ".join(s["text"] for s in segments).strip()
+                    self._json({"text": text, "segments": segments})
+                else:
+                    self._json({"text": _transcribe(payload)})
             except ValueError as e:
                 self._json({"detail": str(e)}, 400)
                 return
             except Exception as e:
                 self._json({"detail": str(e)[:500]}, 500)
                 return
-            self._json({"text": text})
             return
         if path == "/api/voices":
             try:
@@ -468,6 +780,46 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"detail": str(e)[:300]}, 500)
             return
+        if path == "/api/voices/anchor":
+            try:
+                payload = self._body()
+            except ValueError as e:
+                self._json({"detail": str(e)}, 400)
+                return
+            try:
+                out = _steady_anchor(str(payload.get("name", "")),
+                                     float(payload.get("window_sec", 10.0) or 10.0))
+                self._json({"ok": True, **out})
+            except ValueError as e:
+                self._json({"detail": str(e)}, 400)
+            except Exception as e:
+                self._json({"detail": str(e)[:300]}, 500)
+            return
+        if path == "/api/kokoro/load":
+            _kokoro_start()
+            self._json({"ok": True, "started": True})
+            return
+        if path == "/api/kokoro/synth":
+            try:
+                payload = self._body()
+            except ValueError as e:
+                self._json({"detail": str(e)}, 400)
+                return
+            try:
+                wav = _kokoro_synth(payload)
+            except ValueError as e:
+                self._json({"detail": str(e)}, 400)
+                return
+            except Exception as e:
+                self._json({"detail": str(e)[:500]}, 500)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(wav)
+            return
         self._json({"detail": "not found"}, 404)
 
     def do_DELETE(self) -> None:  # noqa: N802
@@ -492,18 +844,41 @@ class _Handler(BaseHTTPRequestHandler):
         print(f"[audio8] {fmt % args}", flush=True)
 
 
+_kokoro_started = False
+
+
+def _kokoro_start() -> None:
+    """Begin Kokoro load + self-test in the background (idempotent)."""
+    global _kokoro_started
+    if _kokoro_started:
+        return
+    _kokoro_started = True
+
+    def _run() -> None:
+        try:
+            _kokoro_ensure("a", _kokoro_device())
+        except Exception as e:
+            print(f"[kokoro] preload failed (will retry on first synthesis): {e}", flush=True)
+        _kokoro_selftest()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Audio8 0.6B local CUDA GPU server for HandScribe (project-local)")
+    ap = argparse.ArgumentParser(description="HandScribe local voice server: Audio8 0.6B + Kokoro-82M (project-local)")
     ap.add_argument("--model", default=MODEL_ID)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
+    ap.add_argument("--no-kokoro", action="store_true", help="skip the Kokoro engine (Audio8/STT only)")
     args = ap.parse_args()
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     _state["model_id"] = args.model
     threading.Thread(target=_load, args=(args.model,), daemon=True).start()
+    if not args.no_kokoro:
+        _kokoro_start()
     srv = ThreadingHTTPServer((args.host, args.port), _Handler)
-    print(f"[audio8] serving on http://{args.host}:{args.port} (model: {args.model})", flush=True)
-    print(f"[audio8] models dir: {MODEL_ROOT} (project-local, nothing global)", flush=True)
+    print(f"[voice] serving on http://{args.host}:{args.port} (model: {args.model})", flush=True)
+    print(f"[voice] models dir: {MODEL_ROOT} (project-local, nothing global)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

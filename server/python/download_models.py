@@ -23,11 +23,13 @@ os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE / "hub"))
 
 AUDIO8_ID = "Audio8/Audio8-TTS-Preview-0.6b"
 STT_ID = "Systran/faster-whisper-small"
+KOKORO_ID = "hexgrad/Kokoro-82M"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-stt", action="store_true")
+    ap.add_argument("--skip-kokoro", action="store_true")
     args = ap.parse_args()
     from huggingface_hub import snapshot_download
 
@@ -40,6 +42,12 @@ def main() -> int:
         print(f"[models] STT {STT_ID} -> {STT_DIR}", flush=True)
         snapshot_download(repo_id=STT_ID, local_dir=str(STT_DIR / "small"))
         print("[models] STT done", flush=True)
+    if not args.skip_kokoro:
+        # Kokoro weights + all voice files, pre-warmed into the project HF
+        # cache (the server loads them from there — nothing global).
+        print(f"[models] Kokoro {KOKORO_ID} -> HF cache", flush=True)
+        snapshot_download(repo_id=KOKORO_ID)
+        print("[models] Kokoro done", flush=True)
     # sizes
     total = sum(p.stat().st_size for p in MODEL_ROOT.rglob("*") if p.is_file()) / (1024**3)
     print(f"[models] total on disk: {total:.2f} GB under {MODEL_ROOT}", flush=True)

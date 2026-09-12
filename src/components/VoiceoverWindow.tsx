@@ -3,17 +3,17 @@ import type { CaptionAnim, EditorClip } from '../engine/editorTypes'
 import { renderTextLayer } from '../engine/editorRender'
 import { DEFAULT_VOICE_FX, type VoiceFxParams } from '../engine/voiceFx'
 import {
-  DEFAULT_PREVIEW_TEXT, MAX_BLOCK_CHARS, VOICES, bankKey, bankStore, buildCaptions,
+  DEFAULT_PREVIEW_TEXT, MAX_BLOCK_CHARS, VOICES, VO_MODEL_SIZE, bankKey, bankStore, buildCaptions,
   cancelPreviewBank, cancelVoiceover, chunkScript, downloadVoiceover, encodeWav,
   ensurePreviewBank, estimateSeconds, generateVoiceover, getBankUrl, peaksOf, previewVoice,
-  renderVoiceFx, sanitizeForTTS,
-  type CaptionCue, type VoEngine, type VoiceoverResult,
+  renderVoiceFx, resetKokoroModel, sanitizeForTTS, setVoiceServerUrl,
+  type CaptionCue, type KokoroDevice, type VoiceBlock, type VoiceoverResult,
 } from '../engine/voiceover'
 import {
   AUDIO8_DEFAULT_URL, AUDIO8_LANGUAGES, AUDIO8_MAX_CHARS, AUDIO8_PRESET_VOICES,
-  AUDIO8_SIZE_STT, AUDIO8_SIZE_TTS, KOKORO_SIZE_FAST, KOKORO_SIZE_QUALITY,
+  AUDIO8_SIZE_STT, AUDIO8_SIZE_TTS, KOKORO_SIZE_MODEL,
   audio8DeleteVoice, audio8Health, audio8ListVoices, audio8ReferenceFromFile, audio8SaveVoice,
-  audio8Transcribe, audio8VoiceAudioUrl, chunkAudio8Script, formatBytes, formatDiskMB,
+  audio8SteadyAnchor, audio8Transcribe, audio8VoiceAudioUrl, chunkAudio8Script, formatBytes, formatDiskMB,
   generateAudio8Voiceover,
   type Audio8Health, type Audio8Language, type SavedVoice,
 } from '../engine/audio8'
@@ -37,6 +37,8 @@ export interface VoiceoverInsert {
   voiceLabel: string
   captions: CaptionCue[]
   captionStyle: CaptionStyle
+  /** exact sentence spans — powers image auto-sync (no STT needed for TTS) */
+  blocks: VoiceBlock[]
 }
 
 export const DEFAULT_CAPTION_STYLE: CaptionStyle = {
@@ -70,8 +72,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
   const [filter, setFilter] = useState<VoiceFilter>('all')
   const [speed, setSpeed] = useState(1)
   const [pause, setPause] = useState(0.45)
-  const [engine, setEngine] = useState<VoEngine>('auto')
-  const [hq, setHq] = useState(false)
+  const [kDevice, setKDevice] = useState<KokoroDevice>('auto')
   /** TTS backend: Kokoro runs 100% in-browser; Audio8 runs on a local CUDA GPU server. */
   const [backend, setBackend] = useState<'kokoro' | 'audio8'>('kokoro')
   const [a8Url, setA8Url] = useState(AUDIO8_DEFAULT_URL)
@@ -93,7 +94,8 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
   const [a8VoiceName, setA8VoiceName] = useState<string | null>(null)
   const [a8SaveName, setA8SaveName] = useState('')
   const [a8Transcribing, setA8Transcribing] = useState(false)
-  const [modelMsg, setModelMsg] = useState('Preparing the voice bank — model downloads once, then all 28 previews render…')
+  const [a8Anchoring, setA8Anchoring] = useState<string | null>(null)
+  const [modelMsg, setModelMsg] = useState('Preparing the voice bank — previews render on the local server…')
   const [modelPct, setModelPct] = useState<number | null>(null)
   const [generating, setGenerating] = useState(false)
   const [genDone, setGenDone] = useState(0)
@@ -132,7 +134,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
     if (previewUrl) URL.revokeObjectURL(previewUrl)
   }, [previewUrl])
 
-  const quality = useMemo(() => ({ engine, quality: (hq ? 'quality' : 'fast') as 'quality' | 'fast' }), [engine, hq])
+  const quality = useMemo(() => ({ device: kDevice }), [kDevice])
   /** Sanitized preview line — bank keys MUST use this (raw text would never hit). */
   const cleanPreview = useMemo(() => sanitizeForTTS(previewText) || DEFAULT_PREVIEW_TEXT, [previewText])
 
@@ -200,6 +202,11 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
       setA8Checking(false)
     }
   }, [a8Url, refreshA8Voices])
+
+  // Kokoro renders on the same project-local server as Audio8.
+  useEffect(() => {
+    setVoiceServerUrl(a8Url)
+  }, [a8Url])
 
   // auto-probe the GPU server whenever the Audio8 backend is picked
   useEffect(() => {
@@ -311,6 +318,25 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
     }
   }
 
+  /** Build a steady anchor from a saved voice (fixes rising-pitch narration). */
+  const onSteadyA8Voice = async (name: string) => {
+    if (a8Anchoring) return
+    setA8Anchoring(name)
+    setModelMsg(`Finding the flattest 10s passage in “${name}”…`)
+    try {
+      const out = await audio8SteadyAnchor(a8Url, name)
+      setA8VoiceName(out.name)
+      setA8RefB64(null); setA8RefMime(null); setA8RefName(null); setA8RefBytes(null)
+      setA8RefText(out.transcript)
+      await refreshA8Voices()
+      setModelMsg(`“${out.name}” ready (from ${out.startSec}s in “${name}”) — narrate from this one: chunks join without the pitch resets.`)
+    } catch (e) {
+      setModelMsg(e instanceof Error ? e.message : 'Steady anchor failed')
+    } finally {
+      setA8Anchoring(null)
+    }
+  }
+
   const onGenerate = async () => {
     if (!script.trim() || generating) return
     if (backend === 'audio8') {
@@ -387,7 +413,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
     }
   }
 
-  /** Render the FX chain in the background worker (tempo rescales timings). */
+  /** Render the FX chain on the main thread (pure DSP, tempo rescales timings). */
   const onApplyFx = () => {
     if (!result || fxWorking) return
     setFxWorking(true)
@@ -434,7 +460,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
           <div className="w-9 h-9 rounded-xl bg-violet-600 flex items-center justify-center text-xl">🎙️</div>
           <div>
             <h2 className="font-bold text-lg leading-none">AI Voiceover Studio</h2>
-            <p className="text-xs text-zinc-400 mt-1">{backend === 'audio8' ? 'Audio8-TTS 0.6B · local CUDA GPU · zero-shot cloning' : 'Kokoro-82M · 100% local text-to-speech · any script length'}</p>
+            <p className="text-xs text-zinc-400 mt-1">{backend === 'audio8' ? 'Audio8-TTS 0.6B · local CUDA GPU · zero-shot cloning' : 'Kokoro-82M · local voice server · speech-verified'}</p>
           </div>
           <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-800 border border-zinc-700" title="TTS backend">
             <button
@@ -589,6 +615,14 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
                           </div>
                           <button onClick={e => { e.stopPropagation(); playUrl(audio8VoiceAudioUrl(a8Url, v.name)) }}
                             className="px-1.5 py-1 text-xs rounded-lg bg-zinc-800 hover:bg-violet-700 border border-zinc-700" title="Play saved clip">🔊</button>
+                          {!v.name.endsWith('-steady') && (
+                            <button onClick={e => { e.stopPropagation(); void onSteadyA8Voice(v.name) }}
+                              disabled={a8Anchoring !== null}
+                              className="px-1.5 py-1 text-xs rounded-lg bg-zinc-800 hover:bg-sky-700 border border-zinc-700 disabled:opacity-40"
+                              title="Build a steady anchor from this voice: carves the flattest 10s passage so long narrations stop rising in pitch. Narrate from the -steady copy.">
+                              {a8Anchoring === v.name ? '⏳' : ' steady'}
+                            </button>
+                          )}
                           <button onClick={e => { e.stopPropagation(); void onDeleteA8Voice(v.name) }}
                             className="px-1.5 py-1 text-xs rounded-lg bg-zinc-800 hover:bg-red-700 border border-zinc-700" title="Delete from project folder">🗑</button>
                         </div>
@@ -729,31 +763,46 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
               ) : (
               <div className="grid grid-cols-2 gap-2">
                 <label className="block text-xs">
-                  <span className="text-zinc-400">Engine</span>
-                  <select value={engine} onChange={e => setEngine(e.target.value as VoEngine)} className="mt-1 w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
-                    <option value="auto">Auto (GPU if available)</option>
-                    <option value="wasm">CPU (WASM)</option>
-                    <option value="webgpu">GPU (WebGPU)</option>
+                  <span className="text-zinc-400">Render device</span>
+                  <select value={kDevice} onChange={e => setKDevice(e.target.value as KokoroDevice)} className="mt-1 w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
+                    <option value="auto">Auto (CUDA if available)</option>
+                    <option value="cuda">CUDA GPU</option>
+                    <option value="cpu">CPU</option>
                   </select>
                 </label>
-                <label className="block text-xs">
-                  <span className="text-zinc-400">Model quality</span>
-                  <select value={hq ? 'hq' : 'fast'} onChange={e => setHq(e.target.value === 'hq')} className="mt-1 w-full bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1.5 text-xs">
-                    <option value="fast">Fast q8 ({KOKORO_SIZE_FAST})</option>
-                    <option value="hq">Best fp32 ({KOKORO_SIZE_QUALITY})</option>
-                  </select>
-                </label>
+                <div className="text-[11px] text-zinc-500 leading-relaxed self-end pb-1">
+                  Full fp32 voices ({KOKORO_SIZE_MODEL}) — verified speech-tested on server start.
+                </div>
               </div>
               )}
               <p className="text-[11px] font-mono text-zinc-500">
                 {backend === 'audio8'
                   ? `💾 Selected: Audio8 0.6B ${AUDIO8_SIZE_TTS} + STT ${AUDIO8_SIZE_STT} (project folder models\\)`
-                  : `💾 Selected: Kokoro-82M ${hq ? KOKORO_SIZE_QUALITY : KOKORO_SIZE_FAST} (browser-cached after first download)`}
+                  : `💾 Selected: Kokoro-82M ${VO_MODEL_SIZE} full fp32 (project folder models\\hf-cache)`}
               </p>
+              {backend === 'kokoro' && (
+                <button
+                  onClick={() => {
+                    if (generating || previewId) return
+                    setModelMsg('Clearing preview bank — re-rendering previews from the server…')
+                    setModelPct(null)
+                    void resetKokoroModel().then(() => {
+                      setBank({ done: 0, total: VOICES.length, cached: 0, active: false })
+                      setModelMsg('Bank cleared — rebuilding previews…')
+                      kickBank()
+                    }).catch(e => setModelMsg(e instanceof Error ? e.message : 'Reset failed'))
+                  }}
+                  disabled={generating || previewId !== null}
+                  className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-red-800 border border-zinc-700 text-[11px] disabled:opacity-40"
+                  title="Clears the preview bank (in-memory + IndexedDB) and re-renders all previews from the server."
+                >
+                  ↻ Rebuild previews
+                </button>
+              )}
               <p className="text-[11px] text-zinc-500 leading-relaxed">
                 {backend === 'audio8'
                   ? 'Audio8 runs on your CUDA GPU outside the browser — the page stays responsive while the server renders.'
-                  : 'Synthesis runs in a background worker — the page stays responsive. Auto uses your GPU when available (GPU always runs fp32 for clean audio).'}
+                  : 'Kokoro renders on your local voice server (CUDA fp32 when available) — the page stays responsive while it renders.'}
               </p>
               {(modelPct !== null || generating) && (
                 <div className="h-2 rounded-full bg-zinc-800 overflow-hidden">
@@ -786,7 +835,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
                     <span className="font-semibold text-emerald-200">
                       ✓ {shown.duration.toFixed(1)}s narration · {shown.blocks.length} blocks
                       <span className="ml-1.5 px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-200 font-bold font-mono" title="Device the voice was rendered on">
-                        {shown.engine.device === 'webgpu' ? '⚡ GPU' : 'CPU'} · {shown.engine.dtype}
+                        {shown.engine.device === 'cuda' || shown.engine.device === 'webgpu' ? '⚡ GPU' : 'CPU'} · {shown.engine.dtype}
                       </span>
                       {fxResult && <span className="ml-1.5 px-1.5 py-0.5 rounded bg-violet-500/30 text-violet-200 font-bold">FX</span>}
                     </span>
@@ -902,6 +951,7 @@ export default function VoiceoverWindow({ onClose, onInsert }: {
                   voiceLabel: meta ? `${meta.label} (${shown.voice})` : shown.voice,
                   captions: captionOn ? buildCaptions(shown.blocks, capStyle.maxWords) : [],
                   captionStyle: capStyle,
+                  blocks: shown.blocks,
                 })
               }}
               disabled={!shown}

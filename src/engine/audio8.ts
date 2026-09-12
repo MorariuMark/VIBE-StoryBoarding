@@ -87,8 +87,7 @@ export interface Audio8Health {
 }
 
 /** Download sizes shown in the app (first-run cost, then cached). */
-export const KOKORO_SIZE_FAST = '~100MB';
-export const KOKORO_SIZE_QUALITY = '~300MB';
+export const KOKORO_SIZE_MODEL = '~330MB';
 export const AUDIO8_SIZE_TTS = '~2.5GB';
 export const AUDIO8_SIZE_STT = '~500MB';
 
@@ -173,6 +172,13 @@ async function throwForBad(res: Response, prefix: string): Promise<never> {
   throw new Error(`${prefix}: HTTP ${res.status}${detail ? ` — ${detail.slice(0, 300)}` : ''}`);
 }
 
+/** One STT segment span (seconds, audio-relative) — for timeline sync. */
+export interface SttSegment {
+  text: string
+  start: number
+  end: number
+}
+
 /** Transcribe a reference clip on the server (faster-whisper, project-local model). */
 export async function audio8Transcribe(
   serverUrl: string,
@@ -180,14 +186,29 @@ export async function audio8Transcribe(
   audioMime?: string | null,
   model?: 'base' | 'small',
 ): Promise<string> {
+  const r = await audio8TranscribeSegments(serverUrl, audioB64, audioMime, model, false)
+  return r.text
+}
+
+/** Transcribe with optional per-segment timestamps (recorded-voiceover sync). */
+export async function audio8TranscribeSegments(
+  serverUrl: string,
+  audioB64: string,
+  audioMime?: string | null,
+  model?: 'base' | 'small',
+  timestamps?: boolean,
+): Promise<{ text: string; segments: SttSegment[] }> {
   const res = await fetch(`${(serverUrl || AUDIO8_DEFAULT_URL).replace(/\/+$/, '')}/api/transcribe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ audio_b64: audioB64, audio_mime: audioMime ?? 'audio/wav', model: model ?? 'small' }),
+    body: JSON.stringify({ audio_b64: audioB64, audio_mime: audioMime ?? 'audio/wav', model: model ?? 'small', timestamps: timestamps ?? false }),
   });
   if (!res.ok) await throwForBad(res, 'Audio8 STT');
-  const j = (await res.json()) as { text?: unknown };
-  return String(j.text ?? '').trim();
+  const j = (await res.json()) as { text?: unknown; segments?: unknown };
+  const segs = Array.isArray(j.segments) ? (j.segments as SttSegment[]).filter(
+    s => s && typeof s.text === 'string' && typeof s.start === 'number' && typeof s.end === 'number',
+  ) : []
+  return { text: String(j.text ?? '').trim(), segments: segs }
 }
 
 /** List clone voices saved in models/audio8/voices/. */
@@ -223,6 +244,34 @@ export async function audio8DeleteVoice(serverUrl: string, name: string): Promis
     { method: 'DELETE' },
   );
   if (!res.ok) await throwForBad(res, 'Audio8 delete voice');
+}
+
+/**
+ * Build a "steady anchor" from a saved voice: the server carves out the
+ * prosodically flattest ~10s passage and saves it as `<name>-steady` with a
+ * fresh transcript. Narrating from the steady anchor instead of a long,
+ * expressive reference removes the per-chunk pitch resets that sound like
+ * the voice rising over time.
+ */
+export async function audio8SteadyAnchor(
+  serverUrl: string,
+  name: string,
+): Promise<{ name: string; transcript: string; startSec: number; sizeBytes: number }> {
+  const res = await fetch(`${(serverUrl || AUDIO8_DEFAULT_URL).replace(/\/+$/, '')}/api/voices/anchor`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, window_sec: 10 }),
+  });
+  if (!res.ok) await throwForBad(res, 'Audio8 steady anchor');
+  const j = (await res.json()) as {
+    name?: unknown; transcript?: unknown; startSec?: unknown; sizeBytes?: unknown;
+  };
+  return {
+    name: String(j.name ?? `${name}-steady`),
+    transcript: String(j.transcript ?? ''),
+    startSec: typeof j.startSec === 'number' ? j.startSec : 0,
+    sizeBytes: typeof j.sizeBytes === 'number' ? j.sizeBytes : 0,
+  };
 }
 
 /** Playback URL for a saved voice clip. */
@@ -342,9 +391,61 @@ async function synthOne(text: string, opts: Audio8Options): Promise<{ samples: F
 }
 
 /**
+ * Join chunk samples with an equal-power crossfade at every boundary.
+ *
+ * Why this exists (measured, not guessed): each narration chunk is an
+ * independent model call, so every chunk re-anchors to its reference's
+ * opening pitch (~110-130 Hz here) while chunk tails scatter anywhere from
+ * ~55 Hz groans to end-of-utterance squeaks. Concatenating those raw edges
+ * produces a sharp upward step every ~10s — heard as "pitch keeps rising".
+ * The crossfade turns each step into a short glide and buries the unreliable
+ * tail/head edges. Chunk time-spans are recomputed from the real layout, so
+ * captions stay sample-accurate.
+ */
+export function crossfadeJoin(
+  chunks: Float32Array[],
+  rate: number,
+  pauseSec: number,
+  overlapSec = 0.25,
+): { samples: Float32Array; spans: { start: number; end: number }[] } {
+  const spans: { start: number; end: number }[] = [];
+  if (!chunks.length) return { samples: new Float32Array(0), spans };
+  const gapBase = Math.max(0, Math.round(pauseSec * rate));
+  // total length pass (overlaps shrink it, gaps grow it)
+  let total = chunks[0].length;
+  const overlaps: number[] = [0];
+  for (let i = 1; i < chunks.length; i++) {
+    const o = Math.min(
+      Math.round(overlapSec * rate),
+      Math.floor(chunks[i - 1].length / 4),
+      Math.floor(chunks[i].length / 4),
+    );
+    overlaps.push(Math.max(0, o));
+    total += Math.max(0, gapBase - o) + chunks[i].length - o;
+  }
+  const out = new Float32Array(total);
+  out.set(chunks[0], 0);
+  spans.push({ start: 0, end: chunks[0].length / rate });
+  let cursor = chunks[0].length;
+  for (let i = 1; i < chunks.length; i++) {
+    const o = overlaps[i];
+    const gap = Math.max(0, gapBase - o);
+    const at = cursor + gap - o; // where chunks[i][0] lands
+    for (let k = 0; k < o; k++) {
+      const t = o <= 1 ? 1 : k / (o - 1);
+      out[at + k] = out[at + k] * Math.cos((t * Math.PI) / 2) + chunks[i][k] * Math.sin((t * Math.PI) / 2);
+    }
+    out.set(chunks[i].subarray(o), at + o);
+    cursor = at + chunks[i].length;
+    spans.push({ start: at / rate, end: cursor / rate });
+  }
+  return { samples: out, spans };
+}
+
+/**
  * Synthesize a full script through the GPU server: short-chunk -> sequential
- * POSTs -> concat with a pause between chunks. Returns per-chunk spans so the
- * existing caption builder stays sentence-accurate.
+ * POSTs -> crossfade-join with the pause between chunks. Returns per-chunk
+ * spans so the existing caption builder stays sentence-accurate.
  */
 export async function generateAudio8Voiceover(
   script: string,
@@ -360,10 +461,8 @@ export async function generateAudio8Voiceover(
     opts.onStatus?.(`Audio8 server is on CPU (${h.device}) — start it with a CUDA GPU for GPU synthesis.`, null);
   }
   const rateGuess = AUDIO8_SAMPLE_RATE;
-  const parts: Float32Array[] = [];
-  const chunks: { text: string; start: number; end: number }[] = [];
+  const synthList: Float32Array[] = [];
   let rate = rateGuess;
-  let cursor = 0;
   for (let i = 0; i < blocks.length; i++) {
     opts.onStatus?.(`Audio8 (GPU) synthesizing ${i + 1}/${blocks.length}…`, i / blocks.length);
     const { samples, rate: r } = await synthOne(blocks[i], opts);
@@ -384,26 +483,14 @@ export async function generateAudio8Voiceover(
     } else {
       rate = r;
     }
-    const start = cursor / rate;
-    parts.push(s);
-    cursor += s.length;
-    const end = cursor / rate;
-    chunks.push({ text: blocks[i], start, end });
-    if (i < blocks.length - 1 && opts.pauseSec > 0) {
-      const gap = new Float32Array(Math.round(opts.pauseSec * rate));
-      parts.push(gap);
-      cursor += gap.length;
-    }
+    synthList.push(s);
     opts.onBlock?.(i + 1, blocks.length);
     opts.onStatus?.(`Audio8 (GPU) synthesizing ${i + 1}/${blocks.length}…`, (i + 1) / blocks.length);
     await new Promise(r2 => setTimeout(r2, 0));
   }
-  const total = cursor;
-  const samples = new Float32Array(total);
-  let w = 0;
-  for (const p of parts) {
-    samples.set(p, w);
-    w += p.length;
-  }
+  // Crossfade-join: turns every chunk-boundary pitch step into a short glide
+  // (see crossfadeJoin). Spans come from the real overlapped layout.
+  const { samples, spans } = crossfadeJoin(synthList, rate, opts.pauseSec);
+  const chunks = blocks.map((text, i) => ({ text, start: spans[i].start, end: spans[i].end }));
   return { samples, rate, chunks };
 }
