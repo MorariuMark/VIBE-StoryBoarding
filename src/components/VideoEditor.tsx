@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { CANVAS_H, CANVAS_W, type BrushType } from '../engine/types'
 import { buildShowTimeline } from '../engine/showcase'
-import { downloadBlob } from '../engine/exporter'
+import { showcaseSlotSpans } from '../engine/showcase'
+import { downloadBlob, pickVideoSaveFile } from '../engine/exporter'
 import {
   defaultProject, findCutBefore, fmtSec, fmtTC, isVisualKind, MOTION_DEFAULTS, projectEnd,
   sourceDuration, trackEnd,
   uidAsset, uidClip, uidPose, uidTrack, uidTransition,
   type AvatarCorner, type AvatarMode, type AvatarPopStyle, type CaptionAnim, type ClipMotion, type EditorClip,
-  type EditorProject, type EditorTrack, type MediaAsset, type TextPreset, type TransitionType,
+  type ClipTransition,
+  type EditorProject, type EditorTrack, type MediaAsset, type TextClipData, type TextPreset, type TransitionType,
 } from '../engine/editorTypes'
 import {
   activeTransitionsAt, cancelEditorExport, computePeaks, contentPivot, createMediaCache,
@@ -18,6 +20,8 @@ import {
 } from '../engine/projectBridge'
 import { ModeTabs, type AppMode } from './shared'
 import VoiceoverWindow, { type VoiceoverInsert } from './VoiceoverWindow'
+import { assignCuts, captionWordClock, layoutRuns, orderBySegments, parseTaggedFilename, planImageSync, sentenceWordClock, sentencesOf, sortByName } from '../engine/imageSync'
+import type { VoiceBlock } from '../engine/voiceover'
 
 type Status = { kind: 'idle' | 'working' | 'error'; msg: string }
 
@@ -69,6 +73,7 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
   const [pxPerSec, setPxPerSec] = useState(42)
   const [snap, setSnap] = useState(true)
   const [expFps, setExpFps] = useState(30)
+  const [expMbps, setExpMbps] = useState(8)
   const [status, setStatus] = useState<Status>({ kind: 'idle', msg: 'Build your film: add a Whiteboard or Showcase scene, or drop in media' })
   const [exportPct, setExportPct] = useState<number | null>(null)
   const [voOpen, setVoOpen] = useState(false)
@@ -88,16 +93,58 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
   const timeRef = useRef(0)
   const playingRef = useRef(false)
   const speedRef = useRef(1)
+  const pxPerSecRef = useRef(pxPerSec)
   const projectRef = useRef(project)
   const cacheRef = useRef<MediaCache>(createMediaCache())
   const lastSeekRef = useRef<Map<string, number>>(new Map())
+  /** exact voiceover sentence spans per VO audio clip — fuels image auto-sync */
+  const voBlocksRef = useRef<Map<number, VoiceBlock[]>>(new Map())
+  /** caption clip ids inserted with each VO (moved/replaced together) */
+  const voCapsRef = useRef<Map<number, number[]>>(new Map())
+  /** live map: clip id → spans RELATIVE to the clip start (drag-safe).
+      Image trims invalidate via dur; slideshow reorder via item names. */
+  const [syncSpans, setSyncSpans] = useState<Record<number, {
+    relStart: number; relEnd: number; dur: number; name: string
+    items?: { relStart: number; relEnd: number; name: string }[]
+  }>>({})
 
   projectRef.current = project
   timeRef.current = time
   playingRef.current = playing
   speedRef.current = speed
+  pxPerSecRef.current = pxPerSec
 
   const selected = useMemo(() => project.clips.find(c => c.id === selectedId) ?? null, [project.clips, selectedId])
+  /** live word-tracked visual: synced span under the playhead.
+      Relative offsets follow timeline drags; trims/reorders hide the chip. */
+  const activeSync = useMemo(() => {
+    const ids = Object.keys(syncSpans)
+    if (!ids.length) return null
+    for (const key of ids) {
+      const id = +key
+      const s = syncSpans[id]
+      const clip = project.clips.find(c => c.id === id)
+      if (!clip) continue
+      if (s.items && clip.payload.kind === 'showcase') {
+        // slideshow: which synced image owns the playhead
+        const d = clip.payload.data
+        if (Math.abs(clip.duration - s.dur) > 1.0) continue
+        if (d.items.length !== s.items.length) continue
+        if (!d.items.every((it, k) => it.name === s.items![k].name)) continue
+        for (const it of s.items) {
+          const a0 = clip.start + it.relStart
+          const a1 = clip.start + it.relEnd
+          if (time >= a0 && time < a1) return it.name
+        }
+        continue
+      }
+      if (Math.abs(clip.duration - s.dur) > 0.6) continue
+      const a0 = clip.start + s.relStart
+      const a1 = clip.start + s.relEnd
+      if (time >= a0 && time < a1) return s.name
+    }
+    return null
+  }, [time, syncSpans, project.clips])
   /** w/h of the selected avatar's first pose (for the transform box); null = fallback */
   const selectedPoseAspect = useMemo(() => {
     if (!selected || selected.payload.kind !== 'avatar') return null
@@ -198,6 +245,11 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
         cache.audios.delete(key)
       }
     }
+    // evict cached show timelines + static lineups of deleted showcase clips
+    const liveShow = new Set<number>()
+    for (const c of p.clips) if (c.payload.kind === 'showcase') liveShow.add(c.id)
+    for (const id of [...cache.showTimelines.keys()]) if (!liveShow.has(id)) cache.showTimelines.delete(id)
+    for (const id of [...cache.showcaseStatic.keys()]) if (!liveShow.has(id)) cache.showcaseStatic.delete(id)
   }, [])
 
   useEffect(() => { syncCache(project) }, [project, syncCache])
@@ -230,10 +282,22 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
     const loop = (ts: number) => {
       try {
         if (modeRef.current !== 'editor') {
+          // hidden tab: freeze the clock AND the media together. Otherwise
+          // audio runs away while the playhead stands still, and returning
+          // snaps the voiceover backwards — the "loop back".
+          const cache = cacheRef.current
+          cache.videos.forEach(v => { if (!v.paused) { try { v.pause() } catch { /* noop */ } } })
+          cache.audios.forEach(a => { if (!a.paused) { try { a.pause() } catch { /* noop */ } } })
           lastTsRef.current = ts
           return
         }
-        const dt = Math.min(0.1, lastTsRef.current ? (ts - lastTsRef.current) / 1000 : 0) * speedRef.current
+        // wall-clock transport (uncapped): capping dt makes the timeline
+        // run slower than the audio on heavy frames, and the drift
+        // correction then yanks the voiceover backwards every few frames.
+        // Hitch guard: after a >5s stall (sleep), freeze one frame and
+        // resume glued instead of teleporting to the end.
+        const rawDt = lastTsRef.current ? (ts - lastTsRef.current) / 1000 : 0
+        const dt = rawDt > 5 ? 0 : Math.max(0, rawDt) * speedRef.current
         lastTsRef.current = ts
         const p = projectRef.current
         if (playingRef.current) {
@@ -245,6 +309,18 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
           }
           timeRef.current = t
           setTime(t)
+          // follow the playhead: once it rolls off-screen, scroll the
+          // timeline so it stays visible (parked ~120px from the left edge).
+          // Paused inspection never scrolls — only active playback follows.
+          const sc = scrollRef.current
+          if (sc) {
+            const x = t * pxPerSecRef.current
+            const left = sc.scrollLeft
+            const w = sc.clientWidth
+            if (x < left + 24 || x > left + w - 60) {
+              sc.scrollLeft = Math.max(0, x - 120)
+            }
+          }
         }
         syncTimelineMedia(p, timeRef.current, playingRef.current, speedRef.current)
         const canvas = canvasRef.current
@@ -285,7 +361,9 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
         try { v.volume = silent ? 0 : Math.min(1, clip.volume) } catch { /* noop */ }
         if (active && isPlaying) matchRate(v)
         if (active && isPlaying && !track?.hidden) {
-          if (Math.abs(v.currentTime - local) > 0.38) {
+          // unbuffered media reports currentTime 0 — yanking it to the
+          // playhead reads as a loop-back stutter, so only correct loaded media
+          if (v.readyState >= 2 && Math.abs(v.currentTime - local) > 0.38) {
             const last = lastSeekRef.current.get(`v${clip.id}`) ?? 0
             if (now - last > 220) {
               lastSeekRef.current.set(`v${clip.id}`, now)
@@ -315,8 +393,10 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
         if (active && isPlaying) {
           matchRate(a)
           // tight correction: captions key off the timeline clock, so the
-          // narration must not drift from it (small nudges beat long lags)
-          if (Math.abs(a.currentTime - local) > 0.25) {
+          // narration must not drift from it (small nudges beat long lags).
+          // skip while unbuffered — seeking a starving element restarts it
+          // audibly, which reads as the voiceover looping back.
+          if (a.readyState >= 2 && Math.abs(a.currentTime - local) > 0.25) {
             try { a.currentTime = Math.max(0, local) } catch { /* noop */ }
           }
           if (a.paused) { void a.play().catch(() => undefined) }
@@ -612,8 +692,9 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
       } catch { /* skip */ }
     }
     if (fresh.length) {
-      setAssets(prev => [...prev, ...fresh])
-      setStatus({ kind: 'idle', msg: `${fresh.length} image(s) in the bin` })
+      const ordered = sortByName(fresh, f => f.name)
+      setAssets(prev => [...prev, ...ordered])
+      setStatus({ kind: 'idle', msg: `${ordered.length} image(s) in the bin` })
     } else setStatus({ kind: 'error', msg: 'No readable images.' })
   }, [])
 
@@ -894,6 +975,26 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
     const aTrack = p.tracks.find(t => t.kind === 'audio')
     const vTrack = p.tracks.find(t => t.kind === 'video')
     if (!aTrack || !vTrack) return
+    // replace previously generated voiceovers — stacked copies of the same
+    // narration play over each other and sound like the voice looping back.
+    // Hand-placed audio is never touched.
+    const prevVoIds = [...voBlocksRef.current.keys()]
+    const prevCapIds = new Set([...voCapsRef.current.values()].flat())
+    const replaced = prevVoIds.length > 0
+    voBlocksRef.current.clear()
+    voCapsRef.current.clear()
+    if (replaced) {
+      setProject(prev => ({
+        ...prev,
+        clips: prev.clips.filter(c => !prevVoIds.includes(c.id) && !prevCapIds.has(c.id)),
+        transitions: prev.transitions.filter(t => !prevVoIds.includes(t.clipId)),
+      }))
+      setSyncSpans(prev => {
+        const nextSpans = { ...prev }
+        for (const id of prevVoIds) delete nextSpans[id]
+        return nextSpans
+      })
+    }
     const at = Math.min(Math.max(0, timeRef.current), p.duration)
     const voId = uidClip()
     const voClip: EditorClip = {
@@ -919,6 +1020,8 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
       },
     }))
     const end = Math.max(at + voClip.duration, ...capClips.map(c => c.start + c.duration))
+    voBlocksRef.current.set(voId, ins.blocks)
+    voCapsRef.current.set(voId, capClips.map(c => c.id))
     setAssets(prev => [...prev, {
       id: uidAsset(), kind: 'audio', name: ins.name, url: ins.url,
       naturalDuration: ins.naturalDuration, videoWidth: 0, videoHeight: 0, peaks: ins.peaks,
@@ -931,10 +1034,370 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
     setSelectedId(voId)
     setStatus({
       kind: 'idle',
-      msg: `Voiceover added (${ins.voiceLabel}, ${voClip.duration.toFixed(1)}s)${capClips.length ? ` + ${capClips.length} synced captions` : ''} — trim, fade & restyle freely`,
+      msg: `Voiceover added (${ins.voiceLabel}, ${voClip.duration.toFixed(1)}s)${capClips.length ? ` + ${capClips.length} synced captions` : ''}${replaced ? ' — replaced previous voiceover' : ''} — trim, fade & restyle freely`,
     })
     setVoOpen(false)
   }, [])
+
+  // ---------- image/showcase ↔ voiceover auto-sync ----------
+  // Filenames hold script wording: each visual shows at its first filename
+  // word and yields at its cut; run-grouped fair layout, pauses stretch
+  // the owning image. Timeline-native, so preview + export follow.
+  const autoSyncImages = useCallback(() => {
+    const p = projectRef.current
+    const voClip = (selectedId != null
+      ? p.clips.find(c => c.id === selectedId && c.kind === 'audio')
+      : undefined)
+      ?? p.clips.find(c => c.kind === 'audio' && voBlocksRef.current.has(c.id))
+      ?? p.clips.find(c => c.kind === 'audio')
+    const blocks = voClip ? (voBlocksRef.current.get(voClip.id) ?? []) : []
+    let sentences = sentencesOf(blocks)
+    if (!sentences.length) {
+      // Fallback: check timeline caption clips (preset 'caption') if in-memory blocks are absent
+      const capClips = p.clips
+        .filter(c => c.kind === 'text' && c.payload.kind === 'text' && c.payload.data.preset === 'caption')
+        .sort((a, b) => a.start - b.start)
+      if (capClips.length) {
+        const base = voClip ? voClip.start : capClips[0].start
+        sentences = capClips.map(c => ({
+          text: (c.payload as { kind: 'text'; data: TextClipData }).data.text,
+          start: Math.max(0, c.start - base),
+          end: Math.max(0.3, c.start + c.duration - base),
+        }))
+      }
+    }
+    if (!sentences.length) {
+      setStatus({ kind: 'error', msg: 'No voiceover or caption timings found — add a voiceover via 🎙 Voiceover or add caption clips to sync against.' })
+      return
+    }
+    // narration + synced visuals always start at 0.0 — move the VO audio
+    // and its captions there first so every span below lands absolute
+    const shift = voClip ? voClip.start : 0
+    if (shift !== 0 && voClip) {
+      const capIds = new Set(voCapsRef.current.get(voClip.id) ?? [])
+      setProject(prev => ({
+        ...prev,
+        clips: prev.clips.map(c => {
+          if (c.id === voClip.id) return { ...c, start: 0 }
+          if (capIds.has(c.id)) return { ...c, start: Math.max(0, c.start - shift) }
+          return c
+        }),
+      }))
+    }
+    const voStart = 0
+    // Caption word clock (shared ground truth for every sync path below):
+    // prefer the timeline's caption clips — their spans are exactly what the
+    // karaoke highlight renders — else rebuild the same cue stream from the
+    // voiceover sentences. Times are VO-relative (shift compensates the move
+    // of the VO + captions to 0 above).
+    const capClipsForClock = p.clips
+      .filter(c => c.kind === 'text' && c.payload.kind === 'text' && (c.payload as { kind: 'text'; data: TextClipData }).data.preset === 'caption')
+      .sort((a, b) => a.start - b.start)
+    const syncClock = capClipsForClock.length
+      ? captionWordClock(capClipsForClock.map(c => {
+          const d = (c.payload as { kind: 'text'; data: TextClipData }).data
+          const words = (d.words && d.words.length ? d.words : d.text.split(/\s+/).filter(Boolean))
+          return { words, start: Math.max(0, c.start - shift), end: Math.max(0.3, c.start + c.duration - shift) }
+        }))
+      : sentenceWordClock(sentences)
+    const showClip = (selectedId != null
+      ? p.clips.find(c => c.id === selectedId && c.kind === 'showcase')
+      : undefined)
+      ?? p.clips.find(c => c.kind === 'showcase')
+    if (showClip && showClip.payload.kind === 'showcase') {
+      syncShowcaseClip(showClip, voClip, sentences, syncClock)
+      return
+    }
+    const images = p.clips
+      .filter(c => c.kind === 'image')
+      .sort((a, b) => a.start - b.start)
+    if (!images.length) {
+      setStatus({ kind: 'error', msg: 'Nothing to sync — drop a 🖼️ Showcase scene or image clips on the timeline first.' })
+      return
+    }
+    const names = images.map(c => c.payload.kind === 'image' ? c.payload.data.name : c.name)
+    const parsedClips = names.map(parseTaggedFilename)
+    const hasExplicitIndices = parsedClips.some(p => p.index !== null)
+    const hasTriggerTags = parsedClips.some(p => p.triggerText !== null)
+    const useNewSystem = hasExplicitIndices || hasTriggerTags
+
+    let orderedImages = [...images]
+    if (hasExplicitIndices) {
+      orderedImages.sort((a, b) => {
+        const pa = parseTaggedFilename(a.payload.kind === 'image' ? a.payload.data.name : a.name)
+        const pb = parseTaggedFilename(b.payload.kind === 'image' ? b.payload.data.name : b.name)
+        const ia = pa.index ?? Infinity
+        const ib = pb.index ?? Infinity
+        return ia - ib || a.name.localeCompare(b.name, undefined, { numeric: true })
+      })
+    }
+
+    const byId = new Map(images.map(c => [c.id, c]))
+    const next = new Map<number, EditorClip>()
+    const transitions: ClipTransition[] = p.transitions.map(t => ({ ...t }))
+    const absSpans: Record<number, { start: number; end: number; name: string }> = {}
+    let matched = 0
+
+    if (useNewSystem) {
+      // ---------------------------------------------------------------
+      // NEW SYSTEM (caption-grounded, two-phase):
+      // Phase 1 (pure math, no clip mutation): build the karaoke
+      // highlight word clock from the caption clips — the same subdivision
+      // renderTextLayer uses, so each word's span is exactly when it
+      // renders highlighted — resolve every image's open/close against it,
+      // and size each dissolve from the time gap between neighbouring
+      // tags. Phase 2 (apply): place clips + transitions from the plan.
+      // ---------------------------------------------------------------
+      const orderedNames = orderedImages.map(c => c.payload.kind === 'image' ? c.payload.data.name : c.name)
+      // PHASE 1 — calculate only (shared caption-clock, built above)
+      const plan = planImageSync(orderedNames, sentences, syncClock)
+      // PHASE 2 — apply the precomputed plan in one pass (no chaining:
+      // every span is absolute, so one overrun can't drag the rest late).
+      // Fades are zeroed: the dissolve transitions own the blend, so the
+      // image is fully opaque exactly when its trigger word highlights.
+      plan.forEach((pl, i) => {
+        const clip = orderedImages[i]
+        const start = voStart + pl.start
+        const end = voStart + pl.end
+        if (pl.matched) matched++
+        const transIn = pl.transIn
+        if (i > 0 && transIn > 0) {
+          const prevClip = next.get(orderedImages[i - 1].id) ?? byId.get(orderedImages[i - 1].id)!
+          next.set(prevClip.id, { ...prevClip, fadeOut: 0, duration: Math.max(0.3, start + transIn - prevClip.start) })
+          const exist = transitions.find(t => t.clipId === clip.id)
+          if (exist) exist.duration = transIn
+          else transitions.push({ id: uidTransition(), trackId: clip.trackId, clipId: clip.id, type: 'dissolve', duration: transIn })
+        }
+        next.set(clip.id, { ...clip, start, fadeIn: 0, fadeOut: 0, duration: Math.max(0.3, end - start) })
+        absSpans[clip.id] = { start, end, name: clip.name }
+      })
+    } else {
+      // ---------------------------------------------------------------
+      // OLD SYSTEM FALLBACK for individual image clips:
+      // Fuzzy text matching & fair run-split layout
+      // ---------------------------------------------------------------
+      const { assigns, voEnd } = assignCuts(names, sentences, { trailingWords: 3 })
+      const slices = layoutRuns(assigns, voEnd, { minSlice: 0.5, tail: 0.5 })
+      matched = assigns.filter(a => a.matched).length
+
+      slices.forEach((sl, i) => {
+        const clip = byId.get(images[i].id)
+        if (!clip) return
+        const start = voStart + (i === 0 || !sl.matched
+          ? sl.start
+          : Math.min(sl.end - 0.3, Math.max(sl.start, assigns[i].showAt)))
+        const end = voStart + sl.end
+        const trailPrev = i === 0 ? 0 : assigns[i - 1].segEnd - assigns[i - 1].cut
+        const transIn = i === 0 ? 0 : sl.runStart
+          ? Math.min(1.5, Math.max(0.2, trailPrev + 0.2))
+          : 0.35
+        if (i > 0 && transIn > 0) {
+          const prevClip = next.get(images[i - 1].id) ?? byId.get(images[i - 1].id)!
+          next.set(prevClip.id, { ...prevClip, duration: Math.max(0.3, start + transIn - prevClip.start) })
+          const exist = transitions.find(t => t.clipId === clip.id)
+          if (exist) exist.duration = transIn
+          else transitions.push({ id: uidTransition(), trackId: clip.trackId, clipId: clip.id, type: 'dissolve', duration: transIn })
+        } else if (i > 0) {
+          const existIdx = transitions.findIndex(t => t.clipId === clip.id)
+          if (existIdx >= 0) transitions.splice(existIdx, 1)
+        }
+        const cur = next.get(clip.id) ?? clip
+        next.set(clip.id, { ...cur, start, duration: Math.max(0.3, end - start) })
+        absSpans[clip.id] = { start, end, name: clip.name }
+      })
+
+      slices.forEach((sl, i) => {
+        if (i + 1 >= slices.length) return
+        const clip = next.get(images[i].id)
+        const nxt = next.get(images[i + 1].id) ?? byId.get(images[i + 1].id)
+        if (!clip || !nxt) return
+        const tr = transitions.find(t => t.clipId === images[i + 1].id)?.duration ?? 0.4
+        const end = nxt.start + tr
+        if (end > clip.start + clip.duration) {
+          next.set(clip.id, { ...clip, duration: end - clip.start })
+          absSpans[clip.id] = { ...absSpans[clip.id], end }
+        }
+      })
+    }
+
+    const lastClip = next.get(orderedImages[orderedImages.length - 1].id) ?? byId.get(orderedImages[orderedImages.length - 1].id)!
+    const end = Math.max(p.duration, lastClip.start + lastClip.duration, voClip?.duration ?? 0)
+    setProject(prev => ({
+      ...prev,
+      clips: prev.clips.map(c => next.get(c.id) ?? c),
+      transitions,
+      duration: Math.max(prev.duration, Math.ceil(end)),
+    }))
+    // drag-safe: store offsets relative to each clip's synced start
+    const rel: Record<number, { relStart: number; relEnd: number; dur: number; name: string }> = {}
+    for (const key of Object.keys(absSpans)) {
+      const id = +key
+      const c = next.get(id) ?? byId.get(id)
+      if (!c) continue
+      rel[id] = {
+        relStart: absSpans[id].start - c.start,
+        relEnd: absSpans[id].end - c.start,
+        dur: c.duration,
+        name: absSpans[id].name,
+      }
+    }
+    setSyncSpans(rel)
+    setStatus({
+      kind: 'idle',
+      msg: useNewSystem
+        ? `[New System] Synced ${orderedImages.length} image clips to caption word timings (dissolves sized from inter-tag gaps).`
+        : `[Fallback] Synced ${images.length} image clips (${matched} name-matched) to voiceover using fuzzy sentence matching.`,
+    })
+  }, [selectedId])
+
+  /** Sync one showcase slideshow: reorder items to the narration, per-item holds. */
+  const syncShowcaseClip = (
+    showClip: EditorClip,
+    voClip: EditorClip | undefined,
+    sentences: { text: string; start: number; end: number }[],
+    clock?: import('../engine/imageSync').CaptionWord[],
+  ) => {
+    if (showClip.payload.kind !== 'showcase') return
+    const d = showClip.payload.data
+    if (!d.items.length) {
+      setStatus({ kind: 'error', msg: 'Showcase clip has no images.' })
+      return
+    }
+    const parsed = d.items.map(it => parseTaggedFilename(it.name))
+    const hasExplicitIndices = parsed.some(p => p.index !== null)
+    const hasTriggerTags = parsed.some(p => p.triggerText !== null)
+    const useNewSystem = hasExplicitIndices || hasTriggerTags
+
+    let orderedItems = [...d.items]
+    if (hasExplicitIndices) {
+      // User explicitly numbered files e.g. "01_...", "[open 1]" — PRESERVE exact numerical sequence
+      orderedItems.sort((a, b) => {
+        const pa = parseTaggedFilename(a.name)
+        const pb = parseTaggedFilename(b.name)
+        const ia = pa.index ?? Infinity
+        const ib = pb.index ?? Infinity
+        return ia - ib || a.name.localeCompare(b.name, undefined, { numeric: true })
+      })
+    } else if (!useNewSystem) {
+      // Fallback: Fuzzy order-free segment matching
+      const names = d.items.map(it => it.name)
+      const order = orderBySegments(names, sentences)
+      orderedItems = order.map(i => d.items[i])
+    }
+
+    const orderedNames = orderedItems.map(it => it.name)
+
+    // sketch intros cost slot time — cap so caption alignment survives
+    const sketchFull = d.sketchOptions.enabled ? d.sketchOptions.duration : 0
+    const sketch = Math.min(sketchFull, 1.0)
+    const sketchCapped = sketchFull > sketch
+
+    const starts: number[] = []
+    const holds: number[] = []
+    const transs: number[] = []
+    let matched = 0
+
+    if (useNewSystem) {
+      // -----------------------------------------------------------------
+      // NEW SYSTEM (caption-grounded, two-phase — same planner as image
+      // clips): every trigger resolves against the karaoke highlight word
+      // clock, all slot boundaries are absolute (no lastExit chaining), and
+      // each exit glide is sized from the gap to the next tag. The first
+      // slot starts at 0 so the video never opens on an empty background.
+      // -----------------------------------------------------------------
+      // PHASE 1 — calculate only
+      const plan = planImageSync(orderedNames, sentences, clock ?? sentenceWordClock(sentences))
+      // PHASE 2 — map the plan onto showcase slots. Builder semantics:
+      // holdEnd = start + sketch + hold (want == closeAt), exit travels
+      // [holdEnd, holdEnd + trans] (want == next entrance's dissolve).
+      const n = plan.length
+      plan.forEach((pl, i) => {
+        if (pl.matched) matched++
+        // Entrance needs its lead time BEFORE the trigger: sketch seconds
+        // when the intro is on, else the plan's own (dissolve-aware) lead.
+        const lead = sketch > 0 ? sketch + 0.15 : pl.openAt - pl.start
+        const slotStart = i === 0 ? 0 : Math.max(0, pl.openAt - lead)
+        starts.push(slotStart)
+        holds.push(Math.max(0.5, pl.closeAt - (slotStart + sketch)))
+        transs.push(i + 1 < n ? Math.max(0.2, plan[i + 1].transIn) : 0.3)
+      })
+    } else {
+      // -----------------------------------------------------------------
+      // OLD SYSTEM FALLBACK:
+      // No index or trigger tags detected on any files.
+      // Uses semantic sentence matching, cut assignment, and fair run-split layout.
+      // -----------------------------------------------------------------
+      const { assigns, voEnd } = assignCuts(orderedNames, sentences, { trailingWords: 3 })
+      matched = assigns.filter(a => a.matched).length
+      const minSlice = Math.max(1.0, sketch + 0.8)
+      const slices = layoutRuns(assigns, voEnd, { minSlice, tail: 0.5 })
+
+      slices.forEach(sl => {
+        const sliceDur = sl.end - sl.start
+        const avail = Math.max(0.6, sliceDur - sketch)
+        const tr = Math.min(1.2, Math.max(0.4, Math.min(d.trans, avail * 0.28)))
+        const h = Math.max(0.3, avail - tr)
+        starts.push(sl.start)
+        holds.push(h)
+        transs.push(tr)
+      })
+    }
+
+    const transEff = transs.length
+      ? transs.slice().sort((x, y) => x - y)[Math.floor(transs.length / 2)]
+      : d.trans
+
+    const tl = buildShowTimeline(orderedItems, d.hold, transEff, 1.2, d.lineup, sketch, holds, transs, starts)
+    // slideshow always starts at 0.0: each image covers its caption window cleanly
+    const clipStart = 0
+    const itemSpans = tl.slots.map(sl => ({
+      relStart: sl.start,
+      relEnd: sl.exitEnd,
+      name: sl.item.name,
+    }))
+    const total = tl.total
+    const dur = Math.max(1, total)
+    // Decode ahead: playback must never outrun image decoding (118 × ~2MB
+    // PNGs decode lazily; an undecoded tile draws nothing while its pin +
+    // yarn already show). Fire-and-forget — the placeholder cards in
+    // drawPhoto cover anything still in flight on first play.
+    try {
+      void Promise.allSettled(orderedItems.map(it => it.img.decode()))
+    } catch { /* engines without HTMLImageElement.decode() */ }
+    setProject(prev => ({
+      ...prev,
+      clips: prev.clips.map(c => {
+        if (c.id !== showClip.id || c.payload.kind !== 'showcase') return c
+        return {
+          ...c,
+          start: clipStart,
+          duration: dur,
+          locked: false,
+          payload: {
+            kind: 'showcase' as const,
+            data: {
+              ...c.payload.data,
+              items: orderedItems,
+              holds,
+              trans: transEff,
+              transs,
+              starts,
+              sketchOptions: { ...c.payload.data.sketchOptions, duration: sketch },
+            },
+          },
+        }
+      }),
+      duration: Math.max(prev.duration, Math.ceil(clipStart + total)),
+    }))
+    setSyncSpans({ [showClip.id]: { relStart: 0, relEnd: total, dur, name: showClip.name, items: itemSpans } })
+    setSelectedId(showClip.id)
+    setStatus({
+      kind: 'idle',
+      msg: useNewSystem
+        ? `[New System] Synced slideshow (${matched}/${orderedItems.length} caption-locked) — absolute slot times, exits sized from inter-tag gaps.`
+        : `[Fallback] No index or tags detected — synced slideshow (${orderedItems.length} images, ${matched} name-matched) to captions using fuzzy matching. (Tip: Use '01_sentence [open 1] trigger [close 1] rest.jpg' for exact word sync).`,
+    })
+  }
 
   // ---------- export ----------
   const onExport = useCallback(async () => {
@@ -946,18 +1409,48 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
       playingRef.current = false
       setPlaying(false)
       setExportPct(0)
-      setStatus({ kind: 'working', msg: 'Rendering 1080p MP4 frame-by-frame (video mix)…' })
+      setStatus({ kind: 'working', msg: 'Rendering 1080p MP4…' })
+      let lastRep = performance.now()
+      let lastF = 0
+      const t0 = lastRep
+      const fileName = `editor-${Date.now()}.mp4`
+      const dest = await pickVideoSaveFile(fileName)
+      const hasAudio = projectRef.current.clips.some(c =>
+        c.payload.kind === 'audio' && !c.muted && c.volume > 0.001 &&
+        !projectRef.current.tracks.find(t => t.id === c.trackId)?.muted,
+      )
+      const audioNote = hasAudio ? ' + timeline audio' : ''
       const blob = await exportEditorProjectFrames(projectRef.current, cacheRef.current, expFps, (f, total) => {
         setExportPct(Math.round((f / total) * 100))
-      })
-      downloadBlob(blob, `editor-${Date.now()}.mp4`)
-      setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @${expFps}fps (audio is preview-only)` })
+        // live throughput readout (throttled — same render pass as the bar)
+        const now = performance.now()
+        if (now - lastRep > 500 || f >= total) {
+          const fps = (f - lastF) / Math.max(1e-3, (now - lastRep) / 1000)
+          const avg = f / Math.max(1e-3, (now - t0) / 1000)
+          lastRep = now
+          lastF = f
+          // background tabs/windows get timer-throttled by the browser no
+          // matter the encoder — tell the user instead of silently crawling
+          const hidden = typeof document !== 'undefined' && document.hidden
+            ? ' · window hidden — keep it focused, background exports throttle'
+            : ''
+          setStatus({ kind: 'working', msg: `Rendering 1080p MP4 — ${Math.round((f / total) * 100)}% · ${fps.toFixed(0)} fps now · ${avg.toFixed(0)} avg${hidden}` })
+        }
+      }, dest, expMbps * 1_000_000)
+      if (blob) {
+        downloadBlob(blob, fileName)
+        setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @${expFps}fps${audioNote}` })
+      } else if (dest) {
+        setStatus({ kind: 'idle', msg: `Saved ${dest.fileName} · 1920×1080 @${expFps}fps${audioNote} (streamed to disk)` })
+      } else {
+        setStatus({ kind: 'error', msg: 'Export produced no output.' })
+      }
     } catch (e) {
       setStatus({ kind: 'error', msg: e instanceof Error ? e.message : 'Export failed' })
     } finally {
       setExportPct(null)
     }
-  }, [expFps])
+  }, [expFps, expMbps])
 
   // ---------- keyboard (only while this tab is visible) ----------
   useEffect(() => {
@@ -1011,6 +1504,7 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
           <span className="px-2 py-1 rounded bg-zinc-800 border border-zinc-700">1920×1080</span>
           <span className="px-2 py-1 rounded bg-zinc-800 border border-zinc-700">{project.clips.length} clips</span>
           <span className="px-2 py-1 rounded bg-zinc-800 border border-zinc-700 font-mono">{fmtTC(time)} / {fmtTC(project.duration)}</span>
+          {activeSync && <span className="px-2 py-1 rounded bg-teal-900 border border-teal-700 text-teal-200 max-w-56 truncate" title={`Synced image on mic: ${activeSync}`}>🖼 {activeSync}</span>}
         </div>
         <button
           onClick={() => setVoOpen(true)}
@@ -1019,8 +1513,18 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
         >
           🎙 Voiceover
         </button>
+        <button
+          onClick={() => autoSyncImages()}
+          title="Snap the slideshow (or image clips) to the voiceover sentences their filenames word — transitions ride the last ~3 words"
+          className="ml-1 px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 font-semibold text-sm shadow-lg shadow-teal-950"
+        >
+          🖼 Sync images
+        </button>
         <select value={expFps} onChange={e => setExpFps(+e.target.value)} className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2 text-xs font-mono" title="Export frame rate">
           {[24, 30, 60].map(v => <option key={v} value={v}>{v} fps</option>)}
+        </select>
+        <select value={expMbps} onChange={e => setExpMbps(+e.target.value)} className="bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-2 text-xs font-mono" title="Export quality (video bitrate — lower is a smaller file)">
+          {[14, 8, 4].map(v => <option key={v} value={v}>{v} Mbps</option>)}
         </select>
         <button
           onClick={() => void onExport()}
@@ -1236,6 +1740,7 @@ export default function VideoEditor({ mode, onMode }: { mode: AppMode; onMode: (
                   onAddTransition={(type) => addTransition(selected.id, type)}
                   showBox={showBox}
                   onToggleBox={() => setShowBox(v => !v)}
+                  onSyncShowcase={() => autoSyncImages()}
                   onReloadPoses={() => {
                     const urls = projectRef.current.avatars.map(a => a.url)
                     if (!urls.length) {
@@ -1500,6 +2005,21 @@ function TimelineClip({ clip, pxPerSec, selected, locked, snap, project, transit
     : clip.payload.kind === 'avatar'
       ? (clip.payload.data.poseUrls[0] ?? null)
       : null
+  // Showcase filmstrip: per-slot thumbs + transition gaps from the SAME
+  // timing inputs the player feeds buildShowTimeline (starts/holds/transs
+  // + sketch/hold/trans fallbacks), so strip boundaries match
+  // renderShowcaseFrame exactly: thumb [start, holdEnd), gap [holdEnd, exitEnd).
+  const showStrip = useMemo(() => {
+    if (clip.payload.kind !== 'showcase') return null
+    const d = clip.payload.data
+    if (!d.items.length) return null
+    const spans = showcaseSlotSpans(d.items.length, {
+      starts: d.starts, holds: d.holds, transs: d.transs,
+      hold: d.hold, trans: d.trans,
+      sketch: d.sketchOptions.enabled ? d.sketchOptions.duration : 0,
+    })
+    return { spans, urls: d.items.map(it => it.url) }
+  }, [clip.payload])
 
   return (
     <div
@@ -1529,6 +2049,48 @@ function TimelineClip({ clip, pxPerSec, selected, locked, snap, project, transit
     >
       <div className={`absolute inset-0 ${st.bar}`} />
       {thumbUrl && <img src={thumbUrl} alt="" draggable={false} className="absolute inset-0 w-full h-full object-cover opacity-50 pointer-events-none" />}
+      {showStrip && (
+        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+          {showStrip.spans.map((s, i) => {
+            const x0 = s.start * pxPerSec
+            const x1 = s.holdEnd * pxPerSec
+            const x2 = s.exitEnd * pxPerSec
+            const wThumb = Math.max(0, x1 - x0)
+            const wTrans = Math.max(0, x2 - x1)
+            if (wThumb < 1 && wTrans < 1) return null
+            return (
+              <div key={i} className="absolute top-0 bottom-0" style={{ left: x0, width: wThumb + wTrans }}>
+                {wThumb >= 1 && (
+                  <div
+                    className="absolute top-0 bottom-0 overflow-hidden border-r border-black/60"
+                    style={{ left: 0, width: wThumb }}
+                    title={`#${i + 1} full-screen ${s.start.toFixed(2)}s → ${s.holdEnd.toFixed(2)}s`}
+                  >
+                    <img src={showStrip.urls[i]} alt="" draggable={false} decoding="async" className="absolute inset-0 w-full h-full object-cover opacity-90 pointer-events-none" />
+                    {wThumb > 22 && (
+                      <span className="absolute left-0.5 bottom-0 text-[9px] font-mono font-bold text-white bg-black/70 px-1 rounded-sm">
+                        {i + 1}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {wTrans >= 2 && (
+                  <div
+                    className="absolute top-0 bottom-0 flex items-center justify-center border-r border-amber-200/70"
+                    style={{
+                      left: wThumb, width: wTrans,
+                      background: 'repeating-linear-gradient(135deg, rgba(251,191,36,0.55) 0 3px, rgba(0,0,0,0.55) 3px 6px)',
+                    }}
+                    title={`transition → #${i + 2} (${(s.exitEnd - s.holdEnd).toFixed(2)}s)`}
+                  >
+                    {wTrans > 14 && <span className="text-[9px] font-bold text-amber-100 drop-shadow">⇄</span>}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       {peaks && peaks.length > 0 && (
         <div className="absolute inset-x-1 inset-y-0 flex items-center gap-[1px] opacity-80 pointer-events-none">
           {peaks.filter((_, i) => i % 3 === 0).map((p, i) => (
@@ -1747,7 +2309,7 @@ function TransformBox({ clip, containerRef, poseAspect, onPatch }: {
 }
 
 // ================= inspector =================
-function Inspector({ clip, captionCount, transition, cutName, libraryPoseCount, showBox, onPatch, onDelete, onDuplicate, onMoveTrack, onFitSource, onApplyStyleToAll, onAddTransition, onReloadPoses, onRemoveTransition, onTransitionPatch, onToggleBox }: {
+function Inspector({ clip, captionCount, transition, cutName, libraryPoseCount, showBox, onPatch, onDelete, onDuplicate, onMoveTrack, onFitSource, onApplyStyleToAll, onAddTransition, onReloadPoses, onRemoveTransition, onTransitionPatch, onToggleBox, onSyncShowcase }: {
   clip: EditorClip
   captionCount: number
   transition?: { type: TransitionType; duration: number }
@@ -1765,6 +2327,7 @@ function Inspector({ clip, captionCount, transition, cutName, libraryPoseCount, 
   onAddTransition: (type: TransitionType) => void
   onRemoveTransition: () => void
   onTransitionPatch: (p: Partial<{ type: TransitionType; duration: number }>) => void
+  onSyncShowcase?: () => void
 }) {
   const src = sourceDuration(clip)
   const setPayload = (fn: (p: EditorClip['payload']) => EditorClip['payload']) => {
@@ -2111,6 +2674,15 @@ function Inspector({ clip, captionCount, transition, cutName, libraryPoseCount, 
             <Slider label="Sketch time" value={sc.sketchOptions.duration} min={1} max={8} step={0.5} fmt={v => `${v.toFixed(1)}s`} onChange={v => setPayload(p => p.kind === 'showcase' ? { ...p, data: { ...p.data, sketchOptions: { ...p.data.sketchOptions, duration: v } } } : p)} />
           )}
           <p className="text-[11px] text-zinc-400">Images: {sc.items.length} — reorder in the Showcase tab, then re-add. Tip: use “Fit to source” after changing hold/sketch.</p>
+          {onSyncShowcase && (
+            <button
+              onClick={onSyncShowcase}
+              className="w-full mt-2 px-3 py-2 text-xs rounded-lg bg-teal-700 hover:bg-teal-600 text-teal-100 font-semibold flex items-center justify-center gap-1.5 shadow"
+              title="Sync this slideshow to voiceover captions (supports new [open 1]...[close 1] convention with automatic fallback to fuzzy matching)"
+            >
+              🖼️ Sync slideshow to voiceover
+            </button>
+          )}
         </div>
       )}
 

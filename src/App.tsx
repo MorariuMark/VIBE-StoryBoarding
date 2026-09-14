@@ -13,7 +13,7 @@ import VideoEditor from './components/VideoEditor'
 import type { AppMode } from './components/shared'
 import { requestAddSceneToEditor, setWhiteboardSnapshot } from './engine/projectBridge'
 import { createDefaultHand, loadImageFromFile, loadImageFromUrl } from './engine/hand'
-import { cancelExport, downloadBlob, exportToMp4 } from './engine/exporter'
+import { cancelExport, downloadBlob, exportToMp4, pickVideoSaveFile } from './engine/exporter'
 import { SAMPLES } from './engine/samples'
 
 type Status = { kind: 'idle' | 'working' | 'error'; msg: string }
@@ -335,11 +335,17 @@ export default function App() {
       setStatus({ kind: 'working', msg: 'Rendering 1080p60 MP4 frame-by-frame…' })
       const hand: CanvasImageSource | null =
         handChoice === 'none' ? null : handChoice === 'custom' ? (handCustomRef.current as unknown as CanvasImageSource | null) : handDefaultRef.current
+      const fileName = `handscribe-${Date.now()}.mp4`
+      const dest = await pickVideoSaveFile(fileName)
       const blob = await exportToMp4(strokes, { ...settings, showHand: handChoice !== 'none' }, hand, 60, (p) => {
         setExportPct(Math.round((p.frame / p.total) * 100))
-      }, revealRef.current, new BrushEngine())
-      downloadBlob(blob, `handscribe-${Date.now()}.mp4`)
-      setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @60fps` })
+      }, revealRef.current, new BrushEngine(), dest)
+      if (blob) {
+        downloadBlob(blob, fileName)
+        setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @60fps` })
+      } else {
+        setStatus({ kind: 'idle', msg: `Saved ${dest?.fileName ?? fileName} · 1920×1080 @60fps (streamed to disk)` })
+      }
     } catch (e) {
       setStatus({ kind: 'error', msg: e instanceof Error ? e.message : 'Export failed' })
     } finally {

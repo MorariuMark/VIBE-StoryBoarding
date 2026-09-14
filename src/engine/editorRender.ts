@@ -9,20 +9,43 @@
 import { CANVAS_H, CANVAS_W } from './types'
 import { BrushEngine } from './brush'
 import { buildTimeline, renderFrame, resolveDurationFor, revealDurationFor } from './renderer'
-import { buildShowTimeline, renderShowcaseFrame } from './showcase'
+import { buildShowTimeline, paintStaticLineupInto, renderShowcaseFrame, type ShowTimeline } from './showcase'
 import { createDefaultHand } from './hand'
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
+import { configureHwEncoder, createExportMuxer, encoderBackpressure, makeExportCanvas, type ExportDestination } from './exporter'
 import { findCutBefore } from './editorTypes'
-import type { ClipMotion, ClipTransition, EditorClip, EditorProject, TextClipData, TransitionType } from './editorTypes'
+import type { ClipMotion, ClipTransition, EditorClip, EditorProject, ShowcaseClipData, TextClipData, TransitionType } from './editorTypes'
 
 export interface MediaCache {
   videos: Map<string, HTMLVideoElement>
   images: Map<string, HTMLImageElement>
   audios: Map<string, HTMLAudioElement>
+  /** pre-rendered docked lineups per showcase clip (ONE reused canvas each) */
+  showcaseStatic: Map<number, { lookKey: string; count: number; canvas: HTMLCanvasElement }>
+  /** built show timelines per showcase clip (layout math done once) */
+  showTimelines: Map<number, { key: string; tl: ShowTimeline }>
 }
 
 export function createMediaCache(): MediaCache {
-  return { videos: new Map(), images: new Map(), audios: new Map() }
+  return {
+    videos: new Map(), images: new Map(), audios: new Map(),
+    showcaseStatic: new Map(), showTimelines: new Map(),
+  }
+}
+
+/** Built show timeline, cached per clip (layout math done once, not per frame). */
+export function getShowTimeline(cache: MediaCache, clipId: number, d: ShowcaseClipData): ShowTimeline {
+  const sketchDur = d.sketchOptions.enabled ? d.sketchOptions.duration : 0
+  const key = [
+    d.items.length, d.items.map(i => i.url).join(','),
+    d.hold, d.trans, sketchDur,
+    JSON.stringify(d.holds ?? null), JSON.stringify(d.transs ?? null), JSON.stringify(d.starts ?? null),
+    JSON.stringify(d.lineup),
+  ].join('|')
+  const hit = cache.showTimelines.get(clipId)
+  if (hit && hit.key === key) return hit.tl
+  const tl = buildShowTimeline(d.items, d.hold, d.trans, 1.2, d.lineup, sketchDur, d.holds, d.transs, d.starts)
+  cache.showTimelines.set(clipId, { key, tl })
+  return tl
 }
 
 let defaultHand: HTMLCanvasElement | null = null
@@ -266,17 +289,56 @@ function renderWhiteboardLayer(ctx: CanvasRenderingContext2D, clip: EditorClip) 
 
 let currentLocal = 0
 
-function renderShowcaseLayer(ctx: CanvasRenderingContext2D, clip: EditorClip, local: number) {
+function renderShowcaseLayer(ctx: CanvasRenderingContext2D, clip: EditorClip, local: number, cache: MediaCache) {
   if (clip.payload.kind !== 'showcase') return
   const d = clip.payload.data
-  const sketchDur = d.sketchOptions.enabled ? d.sketchOptions.duration : 0
-  const tl = buildShowTimeline(d.items, d.hold, d.trans, 1.2, d.lineup, sketchDur)
+  const tl = getShowTimeline(cache, clip.id, d)
+  const lt = Math.min(Math.max(0, local), tl.total)
+  // slots fully docked at lt ride the pre-rendered prefix layer, rebuilt
+  // only when the docked count (or the look) changes — never per frame
+  let docked = 0
+  while (docked < tl.slots.length && lt >= tl.slots[docked].exitEnd) docked++
+  const bgKey = typeof d.bg === 'string' ? d.bg : 'imgbg'
+  const lookKey = `${d.items.length}|${d.items.map(i => i.url).join(',')}|${JSON.stringify(d.lineup)}|${JSON.stringify(d.tileStyle)}|${bgKey}`
+  let staticLayer: HTMLCanvasElement | null = null
+  // never freeze a half-decoded lineup into the cache — fall back to
+  // per-frame drawing until every tile's image is complete
+  const allLoaded = d.items.every(it => it.img.complete && it.img.naturalWidth > 0)
+  if (allLoaded) {
+    let entry = cache.showcaseStatic.get(clip.id)
+    if (!entry || entry.lookKey !== lookKey) {
+      // new look: one fresh canvas (reused for every later docked count)
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = CANVAS_W
+        canvas.height = CANVAS_H
+        paintStaticLineupInto(canvas.getContext('2d')!, d.items, tl.slots, d.tileStyle, docked)
+        entry = { lookKey, count: docked, canvas }
+        cache.showcaseStatic.set(clip.id, entry)
+      } catch {
+        cache.showcaseStatic.delete(clip.id)
+        entry = undefined
+      }
+    } else if (entry.count !== docked) {
+      // same look, more docked: repaint in place — zero new allocations,
+      // so long exports stop churning 8MB canvases into the GC
+      try {
+        paintStaticLineupInto(entry.canvas.getContext('2d')!, d.items, tl.slots, d.tileStyle, docked)
+        entry.count = docked
+      } catch {
+        cache.showcaseStatic.delete(clip.id)
+        entry = undefined
+      }
+    }
+    staticLayer = entry?.canvas ?? null
+  }
   renderShowcaseFrame(
-    ctx, d.items, tl, Math.min(Math.max(0, local), tl.total),
+    ctx, d.items, tl, lt,
     d.bg, d.lineup.connect ? d.lineup.connectColor : null, d.tileStyle,
     d.sketchOptions.enabled
       ? { options: d.sketchOptions, entries: d.sketchEntries, hand: getHand() }
       : null,
+    staticLayer,
   )
 }
 
@@ -421,7 +483,7 @@ export function paintVisualClipLayer(
       currentLocal = local
       renderWhiteboardLayer(lctx, clip)
     } else if (p.kind === 'showcase') {
-      renderShowcaseLayer(lctx, clip, local)
+      renderShowcaseLayer(lctx, clip, local, cache)
     } else if (p.kind === 'image') {
       const img = cache.images.get(p.data.url)
       lctx.fillStyle = '#000'
@@ -714,6 +776,150 @@ export function renderEditorFrame(
   ctx.restore()
 }
 
+/**
+ * Export frame signature: a stable key when the composed frame is provably
+ * identical to a neighbor's (static hold + static caption), null when
+ * anything animates. Lets the export pump skip 1080p rasterization on
+ * static stretches and just feed the same bitmap to the HW encoder —
+ * the dominant cost on slideshow timelines.
+ */
+function exportFrameSignature(project: EditorProject, t: number, cache: MediaCache): string | null {
+  for (const img of cache.images.values()) {
+    if (!img.complete || !img.naturalWidth) return null // still decoding — frames differ
+  }
+  if (activeTransitionsAt(project, t).length) return null
+  const parts: string[] = []
+  for (const clip of project.clips) {
+    if (t < clip.start || t >= clip.start + clip.duration) continue
+    const local = t - clip.start + clip.offset
+    const p = clip.payload
+    if (p.kind === 'audio') continue
+    if (p.kind === 'video' || p.kind === 'whiteboard' || p.kind === 'avatar') return null
+    const fadeActive =
+      (clip.fadeIn > 0 && local < clip.fadeIn) ||
+      (clip.fadeOut > 0 && local > clip.duration - clip.fadeOut)
+    const motionActive =
+      (clip.animIn !== 'none' && local < clip.animInDur) ||
+      (clip.animOut !== 'none' && local > clip.duration - clip.animOutDur)
+    if (p.kind === 'image') {
+      if (p.data.kenBurns) return null
+      if (fadeActive || motionActive) return null
+      parts.push(`img:${clip.id}`)
+      continue
+    }
+    if (p.kind === 'text') {
+      const d = p.data
+      if (fadeActive || motionActive) return null
+      const anim = d.anim ?? 'none'
+      if (anim === 'fade') return null
+      if (anim === 'pop' && local / Math.max(0.01, clip.duration) < 0.25) return null
+      if (anim === 'karaoke') {
+        const n = d.words?.length ?? d.text.split(/\s+/).filter(Boolean).length
+        const q = Math.floor((local / Math.max(0.01, clip.duration)) * Math.max(1, n))
+        parts.push(`txt:${clip.id}:${q}`)
+        continue
+      }
+      parts.push(`txt:${clip.id}`)
+      continue
+    }
+    if (p.kind === 'showcase') {
+      const tl = getShowTimeline(cache, clip.id, p.data)
+      const f = tl.slots.find(s => local >= s.start && local < s.exitEnd)
+      if (!f) {
+        parts.push(`sh:${clip.id}:lineup`)
+        continue
+      }
+      // static only while parked full-size post pop-in (sketch/enter/glide all move)
+      if (local < f.enterEnd || local >= f.holdEnd) return null
+      parts.push(`sh:${clip.id}:${f.index}`)
+      continue
+    }
+  }
+  return parts.join('|')
+}
+
+/**
+ * Offline timeline audio mix (voiceover + audio clips) at 44.1 kHz stereo.
+ * Mirrors preview audibility (mute/volume/track-mute); skips video-embedded
+ * audio (needs a demuxer — out of scope). Null when nothing audible.
+ */
+const AUDIO_SR = 44100
+
+async function renderTimelineAudio(project: EditorProject, total: number): Promise<AudioBuffer | null> {
+  const clips = project.clips.filter(c => {
+    if (c.payload.kind !== 'audio') return false
+    if (c.muted || c.volume <= 0.001) return false
+    const track = project.tracks.find(t => t.id === c.trackId)
+    return !!track && !track.muted
+  })
+  if (!clips.length) return null
+  const len = Math.max(1, Math.ceil(total * AUDIO_SR) + AUDIO_SR)
+  const off = new OfflineAudioContext(2, len, AUDIO_SR)
+  let any = false
+  for (const clip of clips) {
+    if (clip.payload.kind !== 'audio') continue
+    try {
+      const res = await fetch(clip.payload.data.url)
+      const buf = await res.arrayBuffer()
+      // decodeAudioData detaches its input — copy per clip (shared urls)
+      const audio = await off.decodeAudioData(buf.slice(0))
+      if (!audio.duration) continue
+      const src = off.createBufferSource()
+      src.buffer = audio
+      const g = off.createGain()
+      g.gain.value = Math.min(1, Math.max(0, clip.volume))
+      src.connect(g)
+      g.connect(off.destination)
+      const offset = Math.min(Math.max(0, clip.offset), Math.max(0, audio.duration - 0.05))
+      const dur = Math.max(0.05, Math.min(clip.duration, audio.duration - offset))
+      src.start(Math.max(0, clip.start), offset, dur)
+      any = true
+    } catch {
+      continue // unreadable clip — skip it, never fail the export
+    }
+  }
+  if (!any) return null
+  return off.startRendering()
+}
+
+/** AAC-encode a rendered mix into the muxer (128 kbps stereo). */
+async function encodeAudioTrack(
+  muxer: { addAudioChunk: (chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata) => void },
+  audio: AudioBuffer,
+): Promise<void> {
+  const sr = audio.sampleRate
+  const ch = 2
+  const L = audio.getChannelData(0)
+  const R = audio.numberOfChannels > 1 ? audio.getChannelData(1) : L
+  const encoder = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: (e) => console.error('editor audio encoder error', e),
+  })
+  encoder.configure({ codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch, bitrate: 128_000 })
+  const FRAMES = 4096
+  for (let o = 0; o < audio.length; o += FRAMES) {
+    const n = Math.min(FRAMES, audio.length - o)
+    const inter = new Float32Array(n * ch)
+    for (let i = 0; i < n; i++) {
+      inter[i * ch] = L[o + i]
+      inter[i * ch + 1] = R[o + i]
+    }
+    const data = new AudioData({
+      format: 'f32',
+      sampleRate: sr,
+      numberOfFrames: n,
+      numberOfChannels: ch,
+      timestamp: Math.round((o / sr) * 1e6),
+      data: inter.buffer,
+    })
+    encoder.encode(data)
+    data.close()
+    while (encoder.encodeQueueSize > 16) await new Promise(r => setTimeout(r, 0))
+  }
+  await encoder.flush()
+  encoder.close()
+}
+
 function seekVideo(v: HTMLVideoElement, t: number): Promise<void> {
   return new Promise(resolve => {
     const target = Math.min(Math.max(0, t), (v.duration || t) - 0.05)
@@ -748,11 +954,10 @@ export async function exportEditorProjectFrames(
   cache: MediaCache,
   fps: number,
   onProgress?: (frame: number, total: number) => void,
-): Promise<Blob> {
-  const off = document.createElement('canvas')
-  off.width = CANVAS_W
-  off.height = CANVAS_H
-  const octx = off.getContext('2d')!
+  dest: ExportDestination | null = null,
+  bitrate = 8_000_000,
+): Promise<Blob | null> {
+  const { off, ctx: octx } = makeExportCanvas()
 
   // pre-seek all timeline videos to 0 and wait for readiness
   const vids = [...cache.videos.values()]
@@ -786,27 +991,52 @@ export async function exportEditorProjectFrames(
   if (!('VideoEncoder' in window)) {
     throw new Error('WebCodecs VideoEncoder not available. Use Chrome or Edge 94+.')
   }
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: { codec: 'avc', width: CANVAS_W, height: CANVAS_H },
-    fastStart: 'in-memory',
-    firstTimestampBehavior: 'offset',
-  })
+  // timeline audio first (offline mix is faster than realtime; the muxer
+  // interleaves tracks by timestamp no matter the arrival order)
+  const abortFlag = exportEditorProjectFrames as unknown as { __abort?: boolean }
+  let audio: AudioBuffer | null = null
+  try {
+    audio = await renderTimelineAudio(project, total)
+  } catch {
+    audio = null
+  }
+  if (abortFlag.__abort) {
+    abortFlag.__abort = false
+    if (dest) {
+      try { await dest.stream.truncate(0) } catch { /* noop */ }
+      try { await dest.stream.close() } catch { /* noop */ }
+    }
+    throw new Error('Export cancelled')
+  }
+  const { muxer, finalize, discard } = createExportMuxer(
+    dest,
+    audio ? { sampleRate: audio.sampleRate, numberOfChannels: Math.min(2, audio.numberOfChannels) as 1 | 2 } : undefined,
+  )
   const encoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
     error: (e) => console.error('editor encoder error', e),
   })
-  encoder.configure({ codec: 'avc1.640034', width: CANVAS_W, height: CANVAS_H, bitrate: 14_000_000, framerate: fps })
-  const abortFlag = exportEditorProjectFrames as unknown as { __abort?: boolean }
+  configureHwEncoder(encoder, fps, bitrate)
+  // settle webfonts before frame 0 — a mid-export font swap would bake two
+  // typefaces into the video (and defeat the identical-frame skip below)
+  try { await document.fonts.ready } catch { /* noop */ }
+  let lastSig: string | null = null
   try {
     for (let f = 0; f < totalFrames; f++) {
       if (abortFlag.__abort) {
         abortFlag.__abort = false
         try { await encoder.flush(); muxer.finalize() } catch { /* noop */ }
+        await discard()
         throw new Error('Export cancelled')
       }
       const t = Math.min(total, f / fps)
-      await draw(t)
+      // static stretch (slideshow hold + steady caption): reuse the canvas
+      // bitmap and only pay the HW encode, not another 1080p rasterization
+      const sig = exportFrameSignature(project, t, cache)
+      if (sig === null || sig !== lastSig) {
+        await draw(t)
+        lastSig = sig
+      }
       const frame = new VideoFrame(off, { timestamp: Math.round((f / fps) * 1e6), duration: Math.round(1e6 / fps) })
       encoder.encode(frame, { keyFrame: f % (fps * 2) === 0 })
       frame.close()
@@ -814,17 +1044,21 @@ export async function exportEditorProjectFrames(
         onProgress?.(f, totalFrames)
         await new Promise(r => setTimeout(r, 0))
       }
-      if (f % 20 === 19) {
-        while (encoder.encodeQueueSize > 0) await new Promise(r => setTimeout(r, 0))
-        await encoder.flush()
-      }
+      // GPU-friendly backpressure (no flush — flushing stalls the pipeline)
+      if (encoder.encodeQueueSize > 6) await encoderBackpressure(encoder)
     }
     onProgress?.(totalFrames, totalFrames)
     while (encoder.encodeQueueSize > 0) await new Promise(r => setTimeout(r, 0))
     await encoder.flush()
     encoder.close()
-    muxer.finalize()
-    return new Blob([muxer.target.buffer], { type: 'video/mp4' })
+    if (audio) {
+      try {
+        await encodeAudioTrack(muxer, audio)
+      } catch (e) {
+        console.error('editor audio track failed — exporting silent', e)
+      }
+    }
+    return finalize()
   } finally {
     try { encoder.close() } catch { /* noop */ }
   }

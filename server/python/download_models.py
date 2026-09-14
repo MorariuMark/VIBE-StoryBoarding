@@ -20,6 +20,8 @@ HF_CACHE = MODEL_ROOT / "hf-cache"
 
 os.environ.setdefault("HF_HOME", str(HF_CACHE))
 os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE / "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE / "hub"))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE / "hub"))
 
 AUDIO8_ID = "Audio8/Audio8-TTS-Preview-0.6b"
 STT_ID = "Systran/faster-whisper-small"

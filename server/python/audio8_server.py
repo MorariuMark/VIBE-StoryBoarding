@@ -872,6 +872,22 @@ def main() -> None:
     ap.add_argument("--no-kokoro", action="store_true", help="skip the Kokoro engine (Audio8/STT only)")
     args = ap.parse_args()
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    # every run starts clean: drop stale sidecar temp (STT wavs, verify
+    # clips, unfinished fragments) older than a day — never model data
+    try:
+        tmp_dir = ROOT / ".cache" / "tmp"
+        if tmp_dir.is_dir():
+            import time as _time
+
+            now = _time.time()
+            for p in tmp_dir.iterdir():
+                try:
+                    if p.is_file() and now - p.stat().st_mtime > 24 * 3600:
+                        p.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
     _state["model_id"] = args.model
     threading.Thread(target=_load, args=(args.model,), daemon=True).start()
     if not args.no_kokoro:

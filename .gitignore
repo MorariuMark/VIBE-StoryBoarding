@@ -7,3 +7,8 @@ dist-ssr/
 /models/
 /server/python/.venv/
 /server/python/*.log
+# Project-local runtime/caches (never commit, never C:)
+# - .cache/      npm + pip + script temp (pinned by .npmrc / setup bat)
+.cache/
+# - .user-data/  Electron profile (redirected in electron/main.cjs)
+.user-data/

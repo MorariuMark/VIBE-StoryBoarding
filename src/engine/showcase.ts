@@ -82,6 +82,12 @@ export interface ShowTimeline {
   hold: number
   trans: number
   sketch: number
+  /** effective per-item holds (uniform fallback resolved) */
+  holds: number[]
+  /** effective per-item dock-move durations (uniform fallback resolved) */
+  transs: number[]
+  /** effective per-item start times */
+  starts?: number[]
 }
 
 /** Per-image sketch vectors (remapped into the full-card rect) + brush state. */
@@ -305,28 +311,120 @@ export function layoutSlots(items: ShowItem[], opts: LineupOptions): { rect: Pla
 
 export function buildShowTimeline(
   items: ShowItem[], hold: number, trans: number, endHold: number,
-  lineup: LineupOptions, sketchDur = 0,
+  lineup: LineupOptions, sketchDur = 0, holds?: number[], transs?: number[], starts?: number[],
 ): ShowTimeline {
   const sketch = Math.max(0, sketchDur)
   const finals = layoutSlots(items, lineup)
-  const slot = sketch + hold + trans
+  const holdAt = (i: number) => Math.max(0.3, holds?.[i] ?? hold)
+  const transAt = (i: number) => Math.max(0.2, transs?.[i] ?? trans)
+  let t = 0
   const slots: ShowSlot[] = items.map((item, index) => {
-    const start = index * slot
+    const h = holdAt(index)
+    const tr = transAt(index)
+    // Explicit starts (voiceover sync) are absolute caption-clock times and
+    // must NOT be re-chained: clamping to the previous exitEnd reintroduces
+    // the cascade the sync planner already eliminated, drifting every later
+    // image behind its caption. Overlapping slots composite fine (painter
+    // order: the incoming image pops over the outgoing one's lineup glide).
+    const start = starts && starts[index] !== undefined ? Math.max(0, starts[index]) : t
     const sketchEnd = start + sketch
-    const enterDur = Math.min(0.45, hold * 0.25)
-    return {
+    const enterDur = Math.min(0.45, h * 0.25)
+    const slot = {
       item, index, start,
       sketchStart: start,
       sketchEnd,
       enterEnd: sketchEnd + enterDur,
-      holdEnd: sketchEnd + hold,
-      exitEnd: sketchEnd + hold + trans,
+      holdEnd: sketchEnd + h,
+      exitEnd: sketchEnd + h + tr,
       full: containRect(item.img.naturalWidth || 16, item.img.naturalHeight || 9, 90),
       finalRect: finals[index].rect,
       finalRot: finals[index].rot,
     }
+    t = Math.max(t, slot.exitEnd)
+    return slot
   })
-  return { slots, total: items.length ? items.length * slot + endHold : 0, hold, trans, sketch }
+  const effHolds = items.map((_, i) => holdAt(i))
+  const effTranss = items.map((_, i) => transAt(i))
+  return { slots, total: items.length ? t + endHold : 0, hold, trans, sketch, holds: effHolds, transs: effTranss, starts }
+}
+
+/** Slot boundary times without needing decoded images (no rects). */
+export interface ShowSlotSpan {
+  start: number
+  holdEnd: number
+  exitEnd: number
+}
+
+/**
+ * Pure slot boundary times from the same inputs `buildShowTimeline` uses —
+ * identical start/holdEnd/exitEnd math, minus the rect layout (which needs
+ * decoded image sizes). The timeline filmstrip uses this, so strip thumbs
+ * and transition gaps line up exactly with what `renderShowcaseFrame`
+ * displays in the player: thumb [start, holdEnd), transition gap
+ * [holdEnd, exitEnd).
+ */
+export function showcaseSlotSpans(
+  count: number,
+  o: {
+    starts?: number[]
+    holds?: number[]
+    transs?: number[]
+    hold: number
+    trans: number
+    sketch?: number
+  },
+): ShowSlotSpan[] {
+  const sketch = Math.max(0, o.sketch ?? 0)
+  const holdAt = (i: number) => Math.max(0.3, o.holds?.[i] ?? o.hold)
+  const transAt = (i: number) => Math.max(0.2, o.transs?.[i] ?? o.trans)
+  let t = 0
+  const out: ShowSlotSpan[] = []
+  for (let i = 0; i < count; i++) {
+    const h = holdAt(i)
+    const tr = transAt(i)
+    const start = o.starts && o.starts[i] !== undefined ? Math.max(0, o.starts[i]) : t
+    out.push({ start, holdEnd: start + sketch + h, exitEnd: start + sketch + h + tr })
+    t = Math.max(t, start + sketch + h + tr)
+  }
+  return out
+}
+
+/**
+ * Pre-rendered docked lineup PREFIX: slots[0..upto) at their final
+ * rect/tilt (shadows included). Blitting this beats re-rasterizing ~100
+ * shadowed photos per frame — the export bottleneck on big slideshows.
+ * Pixel-identical to the per-frame path (same drawPhoto params, same slot
+ * order, composited once over the live bg). Only fully-docked slots are
+ * included — the lineup visibly fills as images dock, exactly like before.
+ */
+export function paintStaticLineup(
+  items: ShowItem[],
+  slots: ShowSlot[],
+  style: TileStyle,
+  upto: number,
+): HTMLCanvasElement {
+  const c = document.createElement('canvas')
+  c.width = CANVAS_W
+  c.height = CANVAS_H
+  paintStaticLineupInto(c.getContext('2d')!, items, slots, style, upto)
+  return c
+}
+
+/** Repaint the docked prefix into an EXISTING canvas (no reallocation). */
+export function paintStaticLineupInto(
+  ctx: CanvasRenderingContext2D,
+  items: ShowItem[],
+  slots: ShowSlot[],
+  style: TileStyle,
+  upto: number,
+): void {
+  ctx.save()
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
+  const n = Math.max(0, Math.min(upto, slots.length, items.length))
+  for (let i = 0; i < n; i++) {
+    drawPhoto(ctx, slots[i].item.img, slots[i].finalRect, 1, slots[i].finalRot, style)
+  }
+  ctx.restore()
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -350,7 +448,7 @@ function roundRectPath(ctx: CanvasRenderingContext2D, r: Placement, radius: numb
 
 function drawPhoto(
   ctx: CanvasRenderingContext2D, img: HTMLImageElement, r: Placement,
-  alpha: number, rotDeg: number, style: TileStyle,
+  alpha: number, rotDeg: number, style: TileStyle, label?: string,
 ) {
   ctx.save()
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha))
@@ -359,6 +457,27 @@ function drawPhoto(
   ctx.rotate((rotDeg * Math.PI) / 180)
   ctx.translate(-cx, -cy)
   const rad = Math.min(Math.max(0, style.radius), r.dw / 2, r.dh / 2)
+  // An image still decoding must NEVER draw nothing: pins + yarn are pure
+  // vector and always on time, so a missing tile reads as "vanished photo
+  // with floating pins". Draw a labeled placeholder card instead — the
+  // lineup then stays structurally complete until the photo decodes.
+  if (!img || !img.complete || (img.naturalWidth || 0) <= 0) {
+    roundRectPath(ctx, r, rad)
+    ctx.fillStyle = '#171a21'
+    ctx.fill()
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)'
+    ctx.lineWidth = Math.max(2, Math.min(6, r.dw * 0.01))
+    ctx.stroke()
+    if (label) {
+      ctx.fillStyle = 'rgba(255,255,255,0.85)'
+      ctx.font = `700 ${Math.max(18, Math.min(72, r.dh * 0.11))}px ui-monospace, SFMono-Regular, monospace`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, cx, cy)
+    }
+    ctx.restore()
+    return
+  }
   ctx.shadowColor = 'rgba(0,0,0,0.55)'
   ctx.shadowBlur = 36
   ctx.shadowOffsetY = 14
@@ -604,11 +723,16 @@ export function renderShowcaseFrame(
   connectColor: string | null = null,
   style: TileStyle = DEFAULT_TILE_STYLE,
   sketch: SketchRenderState | null = null,
+  staticLayer: HTMLCanvasElement | null = null,
 ) {
   ctx.save()
   paintBackdrop(ctx, bg)
+  // pre-rendered docked lineup (pixel-identical) — per-frame loop then only
+  // draws slots still traveling; fully docked ones ride the blit
+  if (staticLayer) ctx.drawImage(staticLayer, 0, 0)
   for (const s of tl.slots) {
     if (time < s.start) continue
+    if (staticLayer && time >= s.exitEnd) continue // docked — already blitted
     // optional sketch intro: hand-draw the image on a paper card first,
     // then it pops full-size and docks like usual
     const skEntry = sketch && sketch.options.enabled && tl.sketch > 0 && time < s.sketchEnd
@@ -625,15 +749,15 @@ export function renderShowcaseFrame(
         dw: s.full.dw * sc, dh: s.full.dh * sc,
         dx: cx - (s.full.dw * sc) / 2, dy: cy - (s.full.dh * sc) / 2,
       }
-      drawPhoto(ctx, s.item.img, r, p, 0, style)
+      drawPhoto(ctx, s.item.img, r, p, 0, style, `#${s.index + 1}`)
     } else if (time < s.holdEnd) {
-      drawPhoto(ctx, s.item.img, s.full, 1, 0, style)
+      drawPhoto(ctx, s.item.img, s.full, 1, 0, style, `#${s.index + 1}`)
     } else if (time < s.exitEnd) {
       // glide into the final lineup slot (position, size and tilt)
       const p = easeInOutCubic((time - s.holdEnd) / Math.max(1e-6, s.exitEnd - s.holdEnd))
-      drawPhoto(ctx, s.item.img, lerpRect(s.full, s.finalRect, p), 1, s.finalRot * p, style)
+      drawPhoto(ctx, s.item.img, lerpRect(s.full, s.finalRect, p), 1, s.finalRot * p, style, `#${s.index + 1}`)
     } else {
-      drawPhoto(ctx, s.item.img, s.finalRect, 1, s.finalRot, style)
+      drawPhoto(ctx, s.item.img, s.finalRect, 1, s.finalRot, style, `#${s.index + 1}`)
     }
   }
   // detective board: pushpins + sagging yarn over the docked lineup —

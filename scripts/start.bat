@@ -1,6 +1,6 @@
 @echo off
-REM HandScribe starter - double-click to run. Everything stays in this folder.
-cd /d "%~dp0"
+REM HandScribe starter - double-click to run. Everything stays in the project folder.
+cd /d "%~dp0.."
 
 where npm >nul 2>nul
 if errorlevel 1 (

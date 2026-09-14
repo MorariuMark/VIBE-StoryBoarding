@@ -68,6 +68,12 @@ export interface ShowcaseClipData {
   items: ShowItem[]
   hold: number
   trans: number
+  /** per-item hold overrides (voiceover sync) — falls back to uniform hold */
+  holds?: number[]
+  /** per-item dock-move overrides (voiceover sync) — falls back to uniform trans */
+  transs?: number[]
+  /** per-item start time overrides (voiceover sync) */
+  starts?: number[]
   lineup: LineupOptions
   tileStyle: TileStyle
   bg: string | CanvasImageSource
@@ -255,11 +261,18 @@ export function defaultProject(): EditorProject {
  */
 export function findCutBefore(project: EditorProject, clip: EditorClip): EditorClip | null {
   if (!isVisualKind(clip.kind)) return null
+  // The outgoing clip is SUPPOSED to overlap the incoming one by exactly
+  // the transition's duration (it holds, frozen, through the dissolve), so
+  // the tolerance must cover the transition — otherwise dissolves longer
+  // than the butt-cut epsilon are silently skipped and the old clip just
+  // sits underneath the incoming one ("stuck in the background").
+  const trDur = project.transitions.find(t => t.clipId === clip.id)?.duration ?? 0
+  const tol = 0.26 + Math.max(0, trDur)
   let best: EditorClip | null = null
   for (const c of project.clips) {
     if (c.id === clip.id || c.trackId !== clip.trackId || !isVisualKind(c.kind)) continue
     const end = c.start + c.duration
-    if (end <= clip.start + 0.26 && (!best || end > best.start + best.duration)) best = c
+    if (end <= clip.start + tol && (!best || end > best.start + best.duration)) best = c
   }
   return best
 }
@@ -290,7 +303,14 @@ export function sourceDuration(clip: EditorClip): number {
     case 'showcase': {
       const n = p.data.items.length
       const sketch = p.data.sketchOptions.enabled ? p.data.sketchOptions.duration : 0
-      return n ? n * (sketch + p.data.hold + p.data.trans) + 1.2 : 2
+      if (!n) return 2
+      const holds = p.data.holds?.length === n
+        ? p.data.holds
+        : new Array(n).fill(p.data.hold)
+      const transs = p.data.transs?.length === n
+        ? p.data.transs
+        : new Array(n).fill(p.data.trans)
+      return holds.reduce((a, h, i) => a + sketch + Math.max(0.3, h) + Math.max(0.2, transs[i] ?? p.data.trans), 0) + 1.2
     }
     case 'video': return Math.max(0.5, p.data.naturalDuration || clip.duration)
     case 'image':

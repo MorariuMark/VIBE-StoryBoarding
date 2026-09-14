@@ -24,6 +24,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { health, portBusy, serveDist } = require('./lib.cjs');
 
+// Run Chromium (canvas raster + WebCodecs encode) on the discrete GPU.
+// Without this Windows parks Electron on the power-saving iGPU and the
+// NVIDIA card idles at 0% while exports crawl. Must precede app.ready.
+app.commandLine.appendSwitch('force_high_performance_gpu');
+
 const isDev = process.argv.includes('--dev');
 const AUDIO8_PORT = Number(process.env.AUDIO8_PORT || 8010);
 const DEV_URL = process.env.VITE_DEV_URL || 'http://localhost:5173';
@@ -60,6 +65,37 @@ function sidecarState(root) {
 
 let sidecar = null;
 
+// --- project-local profile --------------------------------------------------
+// Everything Chromium persists (IndexedDB voice bank, caches, GPU blobs)
+// lives in <project>/.user-data instead of %APPDATA% — no C: leftovers.
+function redirectProfile() {
+  const dir = path.join(projectRoot(), '.user-data');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // one-time migration: carry the voice bank + prefs over from the legacy
+    // %APPDATA% profile, then leave the old caches behind (regenerable).
+    // Only project data moves; anything else in roaming stays untouched.
+    const candidates = [
+      path.join(app.getPath('appData'), app.getName()),
+      path.join(app.getPath('appData'), 'HandScribe'),
+    ];
+    const keep = ['IndexedDB', 'Local Storage', 'Preferences'];
+    for (const old of candidates) {
+      for (const name of keep) {
+        const src = path.join(old, name);
+        const dst = path.join(dir, name);
+        try {
+          if (!fs.existsSync(dst) && fs.existsSync(src)) fs.renameSync(src, dst);
+        } catch { /* keep the fresh profile on any failure */ }
+      }
+    }
+  } catch { /* profile setup must never block startup */ }
+  try {
+    app.setPath('userData', dir);
+  } catch { /* noop */ }
+}
+redirectProfile();
+
 async function ensureSidecar(root, win) {
   const st = sidecarState(root);
   if (!st.pyOk || !st.scriptOk) {
@@ -89,10 +125,14 @@ async function ensureSidecar(root, win) {
   }
   const logFile = path.join(root, 'server', 'python', 'server.log');
   const log = fs.createWriteStream(logFile, { flags: 'a' });
+  // sidecar temp files (STT wavs, …) stay in the project, not %TEMP%
+  const tmpDir = path.join(root, '.cache', 'tmp');
+  try { fs.mkdirSync(tmpDir, { recursive: true }); } catch { /* noop */ }
   sidecar = spawn(st.py, [st.script, '--host', '127.0.0.1', '--port', String(AUDIO8_PORT)], {
     cwd: root,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, TMPDIR: tmpDir, TEMP: tmpDir, TMP: tmpDir },
   });
   sidecar.stdout.pipe(log, { end: false });
   sidecar.stderr.pipe(log, { end: false });
@@ -131,6 +171,11 @@ async function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      // CRITICAL for exports: Chromium throttles timers/rAF/WebCodecs in
+      // occluded windows (e.g. Task Manager focused). Throttled, the export
+      // pump crawls at ~4fps with CPU+GPU idle. Exports must run full-speed
+      // while the user watches progress elsewhere.
+      backgroundThrottling: false,
     },
   });
 

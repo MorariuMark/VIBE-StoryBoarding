@@ -6,10 +6,11 @@ import {
 } from '../engine/showcase'
 import { BrushEngine } from '../engine/brush'
 import { containRect, rasterToEdgeStrokes } from '../engine/rasterEdges'
-import { cancelExport, downloadBlob, exportFrames } from '../engine/exporter'
+import { cancelExport, downloadBlob, exportFrames, pickVideoSaveFile } from '../engine/exporter'
 import { loadImageFromUrl } from '../engine/hand'
 import { ModeTabs, ScrubBar, type AppMode } from './shared'
 import { requestAddSceneToEditor, setShowcaseSnapshot } from '../engine/projectBridge'
+import { sortByName } from '../engine/imageSync'
 
 type Status = { kind: 'idle' | 'working' | 'error'; msg: string }
 
@@ -272,11 +273,16 @@ export default function ShowcaseMode({ mode, onMode }: { mode: AppMode; onMode: 
       }
     }
     if (fresh.length) {
-      setItems(prev => [...prev, ...fresh])
-      setStatus({ kind: 'idle', msg: `${fresh.length} image(s) added — order them, then press Play` })
+      const ordered = sortByName(fresh, f => f.name)
+      setItems(prev => [...prev, ...ordered])
+      setStatus({ kind: 'idle', msg: `${ordered.length} image(s) added in file order — reorder freely, then press Play` })
     } else {
       setStatus({ kind: 'error', msg: 'No readable images in that drop.' })
     }
+  }, [])
+
+  const sortAZ = useCallback(() => {
+    setItems(prev => sortByName(prev, it => it.name))
   }, [])
 
   const move = useCallback((id: number, dir: -1 | 1) => {
@@ -311,11 +317,17 @@ export default function ShowcaseMode({ mode, onMode }: { mode: AppMode; onMode: 
       const cc = lineup.connect ? lineup.connectColor : null
       const st = tileStyle
       const fps = expFps
+      const fileName = `showcase-${Date.now()}.mp4`
+      const dest = await pickVideoSaveFile(fileName)
       const blob = await exportFrames(t.total, fps, (ctx, tt) => {
         renderShowcaseFrame(ctx, snapshot, t, tt, b, cc, st, sk)
-      }, p => setExportPct(Math.round((p.frame / p.total) * 100)))
-      downloadBlob(blob, `showcase-${Date.now()}.mp4`)
-      setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @${fps}fps` })
+      }, p => setExportPct(Math.round((p.frame / p.total) * 100)), dest)
+      if (blob) {
+        downloadBlob(blob, fileName)
+        setStatus({ kind: 'idle', msg: `Exported ${(blob.size / 1024 / 1024).toFixed(1)} MB MP4 · 1920×1080 @${fps}fps` })
+      } else {
+        setStatus({ kind: 'idle', msg: `Saved ${dest?.fileName ?? fileName} · 1920×1080 @${fps}fps (streamed to disk)` })
+      }
     } catch (e) {
       setStatus({ kind: 'error', msg: e instanceof Error ? e.message : 'Export failed' })
     } finally {
@@ -410,6 +422,9 @@ export default function ShowcaseMode({ mode, onMode }: { mode: AppMode; onMode: 
         <aside className="w-80 shrink-0 border-r border-zinc-800 bg-zinc-900/50 p-4 overflow-y-auto space-y-5">
           <section>
             <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 mb-2">1 · Images in order</h2>
+            <div className="flex gap-1.5 mb-2">
+              <button onClick={sortAZ} disabled={!items.length} title="Sort playlist A–Z by filename (natural number order)" className="px-2 py-1.5 text-xs rounded-lg bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 disabled:opacity-40">⇅ A–Z</button>
+            </div>
             <div
               onDragOver={e => e.preventDefault()}
               onDrop={e => { e.preventDefault(); void addFiles(e.dataTransfer.files) }}

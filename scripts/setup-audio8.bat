@@ -4,6 +4,10 @@ REM Creates server\python\.venv, installs CUDA torch + deps, downloads models in
 setlocal
 cd /d %~dp0\..
 
+REM Keep pip's wheel cache inside the project too (default is %LOCALAPPDATA%\pip).
+set PIP_CACHE_DIR=%CD%\.cache\pip
+if not exist ".cache\pip" mkdir ".cache\pip"
+
 if not exist "server\python\.venv\Scripts\python.exe" (
   echo [setup] creating project venv: server\python\.venv
   python -m venv "server\python\.venv"

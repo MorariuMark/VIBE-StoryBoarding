@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "electron:dev": "electron . --dev",
     "electron": "npm run build && electron .",
-    "electron:dist": "npm run build && electron-builder --win"
+    "electron:dist": "npm run build && electron-builder --win",
+    "test": "node scripts/sync-regression.test.cjs"
   },
   "dependencies": {
     "@imgly/background-removal": "^1.7.0",
